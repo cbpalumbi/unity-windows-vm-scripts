@@ -199,50 +199,65 @@ while ($true) {
             $completionMessagePayload = @{
                 build_id = $receivedBuildId
                 status = $buildStatus
-                gcs_path = $finalGcsPath # Will be empty string if upload failed
-                timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ') # ISO 8601 format
+                gcs_path = $finalGcsPath
+                timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
             } | ConvertTo-Json -Compress
 
+            # Ensure this is set correctly in your actual script
             $receivedSessionId = "placeholder"
 
             try {
-                # Define the arguments for gcloud pubsub topics publish as an array
-                $gcloudArgs = @(
-                    "pubsub",
-                    "topics",
-                    "publish",
-                    $CompletionTopicPath, # No need for explicit quotes here, PowerShell handles it
-                    "--message=$completionMessagePayload", # PowerShell will handle quoting for the JSON string
-                    "--attribute=build_id=$receivedBuildId",
-                    "--attribute=session_id=$receivedSessionId",
-                    "--attribute=status=$buildStatus"
-                )
+                # Step 1: Escape internal double quotes of the JSON payload with a BACKSLASH (`\`).
+                # This is crucial because gcloud expects the JSON message content to have escaped inner quotes.
+                $escapedPayloadForGcloud = $completionMessagePayload.Replace('"', '\"')
 
-                Write-Host "Executing gcloud command: gcloud $($gcloudArgs -join ' ')" # For debugging
+                # Step 2: Construct the --message argument value with outer double quotes for gcloud.
+                # We use PowerShell's backtick (`) to escape the double quotes around the JSON payload
+                # so that they are literally included in the string that cmd.exe will parse.
+                # This will result in a string like: `--message="{\"key\":\"value\"}"`
+                $gcloudMessageArg = "--message=`"$escapedPayloadForGcloud`""
 
-                # Execute gcloud directly. Output will go to stdout/stderr.
-                gcloud @gcloudArgs
+                # Step 3: Construct the *entire* gcloud command as a single PowerShell string.
+                # Each argument that contains spaces or special characters (like the topic path,
+                # the message argument containing JSON, and the attribute values)
+                # is explicitly enclosed in double quotes using PowerShell's backtick for quoting.
+                # This comprehensive string will then be passed to 'cmd.exe /c' for execution.
+                $fullGcloudCommandString = "gcloud pubsub topics publish `"$CompletionTopicPath`" `"$gcloudMessageArg`" --attribute=`"build_id=$receivedBuildId`" --attribute=`"session_id=$receivedSessionId`" --attribute=`"status=$buildStatus`""
 
-                # Check the $LASTEXITCODE variable for success/failure
+                Write-Host "Executing gcloud command via 'cmd /c':"
+                Write-Host $fullGcloudCommandString
+                Write-Host "--- Start gcloud output capture ---"
+
+                # Execute the full command string using cmd.exe /c.
+                # This is a common workaround that forces cmd.exe to parse the command string,
+                # which is often more reliable for complex external command invocations on Windows
+                # than relying solely on PowerShell's direct execution.
+                $gcloudOutput = & cmd.exe /c $fullGcloudCommandString 2>&1
+
+                Write-Host $gcloudOutput
+                Write-Host "--- End gcloud output capture ---"
+
+                Write-Host "gcloud exited with code: $LASTEXITCODE"
+
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "Build completion message published successfully."
                 } else {
                     Write-Error "gcloud command failed with exit code: $LASTEXITCODE"
                 }
 
-            } catch {
-                Write-Error "Error publishing build completion message: $($_.Exception.Message)"
-                # Also output specific error details if available
-                if ($_.Exception.InnerException) {
-                    Write-Error "Inner exception: $($_.Exception.InnerException.Message)"
+                } catch {
+                    Write-Error "Error publishing build completion message: $($_.Exception.Message)"
+                    # Also output specific error details if available
+                    if ($_.Exception.InnerException) {
+                        Write-Error "Inner exception: $($_.Exception.InnerException.Message)"
+                    }
                 }
-            }
 
+            } else {
+                Write-Host "Received unrecognized message: '$messageData'"
+            }
         } else {
-            Write-Host "Received unrecognized message: '$messageData'"
-        }
-    } else {
-        # Write-Host "No messages received. Waiting..."
+            # Write-Host "No messages received. Waiting..."
     }
 
     Start-Sleep -Seconds $PollingIntervalSeconds
