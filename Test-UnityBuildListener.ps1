@@ -33,7 +33,7 @@ Describe "UnityBuildListener Script" {
         if (Test-Path $global:StopFilePath) { Remove-Item $global:StopFilePath -Force }
 
         # Mock external commands and cmdlets that have side effects or external dependencies
-        Mock 'Write-Host' {} # Suppress console output during tests
+        #Mock 'Write-Host' {} # Suppress console output during tests
         Mock 'Add-Content' {} # Suppress file logging during tests, unless testing logging itself
         Mock 'Test-Path' { return $false } # Default to path not existing, override in specific tests
         Mock 'New-Item' { param([string]$Path); New-Object PSObject | Add-Member -MemberType NoteProperty -Name FullName -Value $Path -PassThru } # Simulate New-Item
@@ -150,20 +150,16 @@ Describe "UnityBuildListener Script" {
 ]
 '@
             Mock 'powershell.exe' {
-                param($NoProfile, $Command)
+                param([switch]$NoProfile, [string]$Command)
                 $Command | Should -Match "gcloud pubsub subscriptions pull"
                 $Command | Should -Match "--format=json --limit=1 --auto-ack"
-                # Ensure the mock returns the string directly.
-                # If there were multiple lines, they would be returned as an array of strings by PowerShell.
-                # The `Out-String` in the function then joins them.
-                # For a single JSON block, returning it as a single string should work.
-                return $mockGcloudOutput
+                # Return the string wrapped in an array, so it behaves like `powershell.exe` might return an array of lines.
+                # Out-String will then correctly join this.
+                return @($mockGcloudOutput)
             }
 
-            # This is your current line causing the error:
             $messages = Invoke-GCloudPullMessage -SubscriptionPath "projects/test/subscriptions/test-sub"
 
-            # Your assertions (which are correct if $messages is not null/empty)
             $messages | Should -Not -BeNullOrEmpty
             $messages.Count | Should -Be 1
             $messages[0].message.attributes.build_id | Should -Be "test-build-123"
