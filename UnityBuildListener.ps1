@@ -2,263 +2,323 @@
 # This script listens for Pub/Sub messages and triggers Unity builds.
 
 # --- Configuration Variables ---
-$SubscriptionPath = "projects/cool-ruler-461702-p8/subscriptions/unity-build-subscription"
-$GCSBucket = "gs://my_adk_unity_hackathon_builds_2025" 
-$UnityProjectPath = "C:\UnityProjects\Google_ADK_Example_Game"
-$UnityEditorPath = "C:\Program Files\Unity\Hub\Editor\6000.0.50f1\Editor\Unity.exe"
-$UnityLogFilePath = "C:\Users\unityadmin\Documents\UnityLogs\unity_build_log.txt"
-$BuildOutputBaseFolder = "C:\Users\unityadmin\Documents\UnityBuilds" # Base folder for builds
-$BuildMethod = "BuildScript.PerformBuild" # The method to execute in Unity
-$PollingIntervalSeconds = 5 # How often to poll Pub/Sub for new messages
+$Script:SubscriptionPath = "projects/cool-ruler-461702-p8/subscriptions/unity-build-subscription"
+$Script:GCSBucket = "gs://my_adk_unity_hackathon_builds_2025"
+$Script:UnityProjectPath = "C:\UnityProjects\Google_ADK_Example_Game"
+$Script:UnityEditorPath = "C:\Program Files\Unity\Hub\Editor\6000.0.50f1\Editor\Unity.exe"
+$Script:UnityLogFilePath = "C:\Users\unityadmin\Documents\UnityLogs\unity_build_log.txt"
+$Script:BuildOutputBaseFolder = "C:\Users\unityadmin\Documents\UnityBuilds" # Base folder for builds
+$Script:BuildMethod = "BuildScript.PerformBuild" # The method to execute in Unity
+$Script:PollingIntervalSeconds = 5 # How often to poll Pub/Sub for new messages
+$Script:CompletionTopicPath = "projects/cool-ruler-461702-p8/topics/unity-build-completion-topic"
 
-# --- Pub/Sub Topic for Build Completions ---
-$CompletionTopicPath = "projects/cool-ruler-461702-p8/topics/unity-build-completion-topic"
+# Use $Script: for global variables to ensure they are accessible within functions and the main loop.
+# This prevents scope issues when the script is run as a service.
 
-# --- Ensure Log and Build Output Folders Exist ---
-$LogFolder = Split-Path $UnityLogFilePath -Parent
-if (-not (Test-Path $LogFolder)) {
-    Write-Host "Creating log folder: $LogFolder"
-    New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null
+# --- Helper Functions ---
+
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO" # INFO, WARNING, ERROR
+    )
+    $timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    $logEntry = "[$timestamp] [$Level] $Message"
+    Write-Host $logEntry
+    # Optional: Log to file as well
+    Add-Content -Path $Script:UnityLogFilePath -Value $logEntry
 }
-if (-not (Test-Path $BuildOutputBaseFolder)) {
-    Write-Host "Creating build output base folder: $BuildOutputBaseFolder"
-    New-Item -ItemType Directory -Path $BuildOutputBaseFolder -Force | Out-Null
+
+function Test-AndCreateFolder {
+    param (
+        [string]$Path
+    )
+    if (-not (Test-Path $Path)) {
+        Write-Log "Creating folder: $Path"
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        return $true
+    }
+    return $false
 }
 
-Write-Host "UnityBuildListener Service Started."
-Write-Host "Listening to Pub/Sub subscription: $SubscriptionPath"
-
-while ($true) {
-    # Attempt to pull a message from Pub/Sub
+function Invoke-GCloudPullMessage {
+    param (
+        [string]$SubscriptionPath
+    )
     try {
-        # Construct the gcloud command as a single string, exactly as it would be typed
-        # We need to include --format=json to get attributes like build_id
-        $gcloudCommandString = "gcloud pubsub subscriptions pull `"$SubscriptionPath`" --format=json --limit=1 --auto-ack --quiet" # use --log-http for cleaner output
+        Write-Log "Pulling message from Pub/Sub subscription: $SubscriptionPath"
+        $gcloudCommandString = "gcloud pubsub subscriptions pull `"$SubscriptionPath`" --format=json --limit=1 --auto-ack --quiet"
+        #$messagesJson = powershell.exe -NoProfile -Command $gcloudCommandString | Out-String | Trim()
+        $messagesJson = (powershell.exe -NoProfile -Command $gcloudCommandString | Out-String).Trim()
 
-        # Execute this command string using powershell.exe, and capture its output into $messagesJson
-        $messagesJson = powershell.exe -NoProfile -Command $gcloudCommandString | Out-String
 
-        # Trim the result of Out-String immediately after capturing it
-        $messagesJson = $messagesJson.Trim()
-
-        # Check if the output contains "ERROR:" which indicates a gcloud failure
         if ($messagesJson -like "*ERROR:*") {
             throw "gcloud command failed: $messagesJson"
         }
+        
+        if (-not ($messagesJson -match '^\s*\[\s*\]\s*$') -and -not [string]::IsNullOrWhiteSpace($messagesJson)) {
+            return $messagesJson | ConvertFrom-Json
+        } else {
+            return @() # Return empty array if no messages
+        }
     } catch {
-        Write-Error "Error pulling Pub/Sub message: $($_.Exception.Message)"
-        Write-Error "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)" # Add line number for debugging
-        Start-Sleep -Seconds $PollingIntervalSeconds
-        continue
+        Write-Log "Error pulling Pub/Sub message: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)" -Level "ERROR"
+        return $null # Indicate failure
+    }
+}
+
+function Invoke-GCloudPublishMessage {
+    param (
+        [string]$TopicPath,
+        [hashtable]$MessageAttributes,
+        [hashtable]$MessagePayload
+    )
+    try {
+        $completionMessagePayloadJson = $MessagePayload | ConvertTo-Json -Compress
+        $escapedPayloadForGcloud = $completionMessagePayloadJson.Replace('"', '\"')
+        $gcloudMessageArg = "--message=`"$escapedPayloadForGcloud`""
+
+        $attributeArgs = @()
+        foreach ($key in $MessageAttributes.Keys) {
+            $value = $MessageAttributes[$key]
+            $attributeArgs += "--attribute=`"$key=$value`""
+        }
+        $attributeArgsString = $attributeArgs -join ' '
+
+        $fullGcloudCommandString = "gcloud pubsub topics publish `"$TopicPath`" `"$gcloudMessageArg`" $attributeArgsString"
+
+        Write-Log "Executing gcloud publish command via 'cmd /c':"
+        Write-Log $fullGcloudCommandString
+
+        $gcloudOutput = & cmd.exe /c $fullGcloudCommandString 2>&1
+
+        Write-Log "gcloud publish output: $($gcloudOutput | Out-String)"
+        Write-Log "gcloud exited with code: $LASTEXITCODE"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "gcloud command failed with exit code: $LASTEXITCODE"
+        }
+        Write-Log "Build completion message published successfully."
+        return $true
+    } catch {
+        Write-Log "Error publishing build completion message: $($_.Exception.Message)" -Level "ERROR"
+        if ($_.Exception.InnerException) {
+            Write-Log "Inner exception: $($_.Exception.InnerException.Message)" -Level "ERROR"
+        }
+        return $false
+    }
+}
+
+function Invoke-GitOperations {
+    param (
+        [string]$ProjectPath,
+        [string]$GitReference
+    )
+    Set-Location $ProjectPath
+    try {
+        Write-Log "Fetching latest changes..."
+        #powershell.exe -NoProfile -Command "git fetch --all" | Out-String | Write-Log
+        Write-Log ((powershell.exe -NoProfile -Command "git fetch --all") | Out-String)
+
+        Write-Log "Checking out Git reference: $GitReference"
+        #powershell.exe -NoProfile -Command "git checkout `"$GitReference`"" | Out-String | Write-Log
+        Write-Log ((powershell.exe -NoProfile -Command "git checkout `"$GitReference`"") | Out-String)
+
+        Write-Log "Pulling latest changes for $GitReference..."
+        #powershell.exe -NoProfile -Command "git pull origin `"$GitReference`"" | Out-String | Write-Log
+        Write-Log ((powershell.exe -NoProfile -Command "git pull origin `"$GitReference`"") | Out-String)
+
+        Write-Log "Git operations complete."
+        return $true
+    } catch {
+        Write-Log "Git operation failed: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)" -Level "ERROR"
+        return $false
+    }
+}
+
+function Invoke-UnityBuild {
+    param (
+        [string]$UnityEditorPath,
+        [string]$UnityProjectPath,
+        [string]$UnityLogFilePath,
+        [string]$BuildMethod,
+        [string]$BuildOutputFolder,
+        [string]$ExeName = "Google_ADK_Example_Game.exe"
+    )
+    $FinalExePath = Join-Path $BuildOutputFolder $ExeName
+
+    if (-not (Test-AndCreateFolder $BuildOutputFolder)) {
+        Write-Log "Build output folder already exists: $BuildOutputFolder"
     }
 
-    # If $messagesJson is empty or just whitespace after Trim(), ConvertFrom-Json will error.
-    # We need to handle cases where no message was pulled successfully.
-    if (-not ($messagesJson -match '^\s*\[\s*\]\s*$') -and -not [string]::IsNullOrWhiteSpace($messagesJson)) {
-        # Only attempt to convert if it looks like actual JSON data (not empty array or just whitespace)
-        try {
-            $messages = $messagesJson | ConvertFrom-Json
-        } catch {
-            Write-Error "Failed to parse JSON from gcloud output: $($_.Exception.Message)"
-            Write-Error "Raw gcloud output: $messagesJson"
-            Start-Sleep -Seconds $PollingIntervalSeconds
-            continue
-        }
+    $unityCommand = "`"$UnityEditorPath`""
+    $unityArgs = @(
+        "-batchmode",
+        "-quit",
+        "-logFile", "`"$UnityLogFilePath`"",
+        "-projectPath", "`"$UnityProjectPath`"",
+        "-executeMethod", "$BuildMethod",
+        "-buildWindowsPlayer", "`"$FinalExePath`""
+    )
+
+    Write-Log "Executing Unity command: $unityCommand $($unityArgs -join ' ')"
+
+    $process = Start-Process -FilePath $unityCommand -ArgumentList $unityArgs -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
+
+    if ($process.ExitCode -eq 0) {
+        Write-Log "Unity build completed successfully."
+        return $true
     } else {
-        # No messages or empty JSON array, continue to next poll cycle
-        $messages = @() # Ensure $messages is an empty array if no messages were pulled
-        # Write-Host "No messages received. Waiting..." # Uncomment for more verbose 'no message' logging
+        Write-Log "Unity build failed with exit code $($process.ExitCode). Check log file: $UnityLogFilePath" -Level "ERROR"
+        return $false
     }
+}
+
+function Invoke-GCSUpload {
+    param (
+        [string]$LocalPath,
+        [string]$GCSBucket,
+        [string]$GCSObjectPrefix
+    )
+    try {
+        $finalGcsPath = "$GCSBucket/$GCSObjectPrefix"
+        Write-Log "Uploading '$LocalPath' to GCS: '$finalGcsPath'"
+
+        # Upload directory content
+        $gsutilCommandStringDir = "gsutil cp -r `"$LocalPath\*`" `"$finalGcsPath`""
+        #powershell.exe -NoProfile -Command $gsutilCommandStringDir | Out-String | Write-Log
+        Write-Log ((powershell.exe -NoProfile -Command $gsutilCommandStringDir) | Out-String)
+
+
+        # Upload specific log file if it's outside the directory
+        if ($LocalPath -ne $Script:UnityLogFilePath) { # Avoid double upload if log is inside
+            $gsutilLogCommandString = "gsutil cp `"$Script:UnityLogFilePath`" `"$finalGcsPath`""
+            #powershell.exe -NoProfile -Command $gsutilLogCommandString | Out-String | Write-Log
+            Write-Log ((powershell.exe -NoProfile -Command $gsutilLogCommandString) | Out-String)
+
+        }
+
+        Write-Log "Artifacts uploaded to $finalGcsPath"
+        return $true, $finalGcsPath
+    } catch {
+        Write-Log "Error uploading to GCS: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)" -Level "ERROR"
+        return $false, $null
+    }
+}
+
+# --- Main Listener Loop ---
+
+# Ensure initial folders exist
+
+Test-AndCreateFolder (Split-Path $Script:UnityLogFilePath -Parent)
+Test-AndCreateFolder $Script:BuildOutputBaseFolder
+
+Write-Log "UnityBuildListener Service Started."
+Write-Log "Listening to Pub/Sub subscription: $Script:SubscriptionPath"
+
+while ($true) {
+    $messages = Invoke-GCloudPullMessage -SubscriptionPath $Script:SubscriptionPath
 
     if ($messages -and $messages.Count -gt 0) {
-        $message = $messages[0].message # Get the actual message object
+        $message = $messages[0].message
         $decodedBytes = [System.Convert]::FromBase64String($message.data)
         $messageData = [System.Text.Encoding]::UTF8.GetString($decodedBytes).Trim()
-        Write-Host "Received message: '$messageData'"
+        Write-Log "Received message data: '$messageData'"
 
-        # --- Extract build_id from message attributes ---
         $receivedBuildId = $message.attributes.build_id
-        if ($receivedBuildId) {
-            Write-Host "Extracted build_id from attributes: $receivedBuildId"
-        } else {
-            Write-Host "No build_id found in message attributes."
-            # Assign a placeholder if no build_id is found (e.g., for legacy messages)
+        if (-not $receivedBuildId) {
+            Write-Log "No build_id found in message attributes. Generating a new one." -Level "WARNING"
             $receivedBuildId = "unknown_build_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
         }
+        Write-Log "Processing build_id: $receivedBuildId"
 
-        # --- Check for 'nobuild' flag from message attributes ---
-        # Initialize the flag to false by default
-        $skipUnityBuild = $false
-        $nobuildAttributeValue = $message.attributes.nobuild
-
-        if ($nobuildAttributeValue) {
-            Write-Host "Extracted 'nobuild' attribute from attributes: '$nobuildAttributeValue'"
-            if ($nobuildAttributeValue -eq "true") {
-                $skipUnityBuild = $true
-                Write-Host "NOTE: 'nobuild' flag is 'true'. Unity build will be skipped."
-            } else {
-                Write-Host "NOTE: 'nobuild' attribute found but its value ('$nobuildAttributeValue') is not 'true'. Proceeding with build."
-            }
-        } else {
-            Write-Host "No 'nobuild' attribute found in message attributes. Proceeding with build."
+        $skipUnityBuild = ($message.attributes.nobuild -eq "true")
+        if ($skipUnityBuild) {
+            Write-Log "NOTE: 'nobuild' flag is 'true'. Unity build will be skipped."
         }
 
-        # --- Initialize variables for completion message ---
-        $buildStatus = "failed" # Assume failure unless successful
+        $buildStatus = "failed"
         $finalGcsPath = ""
-        $currentBuildOutputFolder = "" # To store the specific build folder for the current operation
+        $currentBuildOutputFolder = ""
+        $gitRef = $null # Initialize gitRef
 
-        # --- Message Processing Logic ---
         if ($messageData -eq "start_build_for_unityadmin" -or $messageData -like "checkout_and_build:*") {
-            if ($skipUnityBuild) {
-                Write-Host "Skipping actual Unity build based on --nobuild flag."
-                $buildStatus = "nobuild"
-                
-            } else {
-                Write-Host "Proceeding with actual Unity build..."
-                $gitRef = $null
-                if ($messageData -like "checkout_and_build:*") {
-                    $gitRef = $messageData.Split(":")[1]
-                    Write-Host "Received request to checkout Git ref '$gitRef' and build."
-                    Set-Location $UnityProjectPath
-                    try {
-                        Write-Host "Fetching latest changes..."
-                        powershell.exe -NoProfile -Command "git fetch --all" | Out-String | Write-Host
-                        Write-Host "Checking out Git reference: $gitRef"
-                        powershell.exe -NoProfile -Command "git checkout `"$gitRef`"" | Out-String | Write-Host
-                        Write-Host "Pulling latest changes for $gitRef..."
-                        powershell.exe -NoProfile -Command "git pull origin `"$gitRef`"" | Out-String | Write-Host
-                        Write-Host "Git operations complete. Now triggering build for '$gitRef'."
-                    } catch {
-                        Write-Error "Git operation failed: $($_.Exception.Message)"
-                        Write-Error "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)"
-                        # Don't exit, try to proceed to Unity build, but ensure status reflects failure
-                        $buildStatus = "git_failed"
-                    }
-                    $currentBuildOutputFolder = Join-Path $BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($gitRef -replace '[^a-zA-Z0-9_.-]', '_')"
-                } else { # For "start_build_for_unityadmin"
-                    Write-Host "Triggering standard Unity build..."
-                    $currentBuildOutputFolder = Join-Path $BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                }
-
-                $FinalExePath = Join-Path $currentBuildOutputFolder "Google_ADK_Example_Game.exe"
-
-                # Create the specific build output folder
-                if (-not (Test-Path $currentBuildOutputFolder)) {
-                    New-Item -ItemType Directory -Path $currentBuildOutputFolder -Force | Out-Null
-                    Write-Host "Created build output folder: $currentBuildOutputFolder"
-                }
-
-                # --- Construct and Execute Unity Build Command ---
-                $unityCommand = "`"$UnityEditorPath`"" # Enclose path in quotes
-                $unityArgs = @(
-                    "-batchmode",
-                    "-quit",
-                    "-logFile", "`"$UnityLogFilePath`"",
-                    "-projectPath", "`"$UnityProjectPath`"",
-                    "-executeMethod", "$BuildMethod",
-                    "-buildWindowsPlayer", "`"$FinalExePath`"" # Enclose path in quotes
-                )
-
-                Write-Host "Executing Unity command: $unityCommand $($unityArgs -join ' ')"
-
-                $process = Start-Process -FilePath $unityCommand -ArgumentList $unityArgs -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
-
-                if ($process.ExitCode -eq 0) {
-                    Write-Host "Unity build completed successfully."
-                    $buildStatus = "success" # Update status
-
-                    # --- Upload Output Files to GCS ---
-                    Write-Host "Uploading build artifacts to GCS..."
-                    $gcsObjectPrefix = "builds/$receivedBuildId/" # Use build_id for GCS path
-                    $finalGcsPath = "$GCSBucket/$gcsObjectPrefix" # Store this for completion message
-
-                    try {
-                        $gsutilCommandString = "gsutil cp -r `"$currentBuildOutputFolder\*`" `"$finalGcsPath`""
-                        powershell.exe -NoProfile -Command $gsutilCommandString | Out-String | Write-Host
-
-                        $gsutilLogCommandString = "gsutil cp `"$UnityLogFilePath`" `"$finalGcsPath`""
-                        powershell.exe -NoProfile -Command $gsutilLogCommandString | Out-String | Write-Host
-
-                        Write-Host "Artifacts uploaded to $finalGcsPath"
-                        Write-Host "Unity build log uploaded."
-                    } catch {
-                        Write-Error "Error uploading to GCS: $($_.Exception.Message)"
-                        Write-Error "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)"
-                        $buildStatus = "upload_failed" # Update status for upload failure
-                    }
+            if ($messageData -like "checkout_and_build:*") {
+                $gitRef = $messageData.Split(":")[1]
+                Write-Log "Request to checkout Git ref '$gitRef' and build."
+                if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $gitRef)) {
+                    $buildStatus = "git_failed"
+                    Write-Log "Git operations failed. Not attempting Unity build." -Level "ERROR"
                 } else {
-                    Write-Error "Unity build failed with exit code $($process.ExitCode). Check log file: $UnityLogFilePath"
-                    # $buildStatus is already "failed" by default
+                    Write-Log "Git operations successful."
+                }
+            } else {
+                Write-Log "Triggering standard Unity build (no specific Git ref)."
+            }
+
+            # Determine build output folder name
+            if ($gitRef) {
+                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($gitRef -replace '[^a-zA-Z0-9_.-]', '_')"
+            } else {
+                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            }
+
+            if ($buildStatus -ne "git_failed") { # Only attempt Unity build if Git ops succeeded or not applicable
+                if ($skipUnityBuild) {
+                    Write-Log "Skipping actual Unity build based on --nobuild flag."
+                    $buildStatus = "nobuild"
+                } else {
+                    Write-Log "Proceeding with actual Unity build..."
+                    if (Invoke-UnityBuild -UnityEditorPath $Script:UnityEditorPath `
+                                        -UnityProjectPath $Script:UnityProjectPath `
+                                        -UnityLogFilePath $Script:UnityLogFilePath `
+                                        -BuildMethod $Script:BuildMethod `
+                                        -BuildOutputFolder $currentBuildOutputFolder) {
+                        $buildStatus = "success"
+                    } else {
+                        $buildStatus = "unity_build_failed"
+                    }
                 }
             }
 
-            # --- Publish Build Completion Message ---
-            Write-Host "Publishing build completion message for build_id: $receivedBuildId with status: $buildStatus"
+            # Upload artifacts if the build (or no-build) was processed and a folder was created
+            if ($buildStatus -eq "success" -or $buildStatus -eq "nobuild") {
+                $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $currentBuildOutputFolder `
+                                                        -GCSBucket $Script:GCSBucket `
+                                                        -GCSObjectPrefix "builds/$receivedBuildId/"
+                if ($uploadSuccess) {
+                    $finalGcsPath = $uploadedPath
+                } else {
+                    $buildStatus = "upload_failed"
+                    Write-Log "GCS upload failed." -Level "ERROR"
+                }
+            } else {
+                Write-Log "Skipping GCS upload due to build status: $buildStatus"
+            }
 
-            $completionMessagePayload = @{
+            # Publish completion message
+            $completionAttributes = @{
                 build_id = $receivedBuildId
                 status = $buildStatus
+                # Add session_id if you extract it from the incoming message
+                # For now, it's a placeholder
+                session_id = "placeholder"
+            }
+            $completionPayload = @{
+                message = "Build completed for $receivedBuildId"
                 gcs_path = $finalGcsPath
                 timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
-            } | ConvertTo-Json -Compress
-
-            # Ensure this is set correctly in your actual script
-            $receivedSessionId = "placeholder"
-
-            try {
-                # Step 1: Escape internal double quotes of the JSON payload with a BACKSLASH (`\`).
-                # This is crucial because gcloud expects the JSON message content to have escaped inner quotes.
-                $escapedPayloadForGcloud = $completionMessagePayload.Replace('"', '\"')
-
-                # Step 2: Construct the --message argument value with outer double quotes for gcloud.
-                # We use PowerShell's backtick (`) to escape the double quotes around the JSON payload
-                # so that they are literally included in the string that cmd.exe will parse.
-                # This will result in a string like: `--message="{\"key\":\"value\"}"`
-                $gcloudMessageArg = "--message=`"$escapedPayloadForGcloud`""
-
-                # Step 3: Construct the *entire* gcloud command as a single PowerShell string.
-                # Each argument that contains spaces or special characters (like the topic path,
-                # the message argument containing JSON, and the attribute values)
-                # is explicitly enclosed in double quotes using PowerShell's backtick for quoting.
-                # This comprehensive string will then be passed to 'cmd.exe /c' for execution.
-                $fullGcloudCommandString = "gcloud pubsub topics publish `"$CompletionTopicPath`" `"$gcloudMessageArg`" --attribute=`"build_id=$receivedBuildId`" --attribute=`"session_id=$receivedSessionId`" --attribute=`"status=$buildStatus`""
-
-                Write-Host "Executing gcloud command via 'cmd /c':"
-                Write-Host $fullGcloudCommandString
-                Write-Host "--- Start gcloud output capture ---"
-
-                # Execute the full command string using cmd.exe /c.
-                # This is a common workaround that forces cmd.exe to parse the command string,
-                # which is often more reliable for complex external command invocations on Windows
-                # than relying solely on PowerShell's direct execution.
-                $gcloudOutput = & cmd.exe /c $fullGcloudCommandString 2>&1
-
-                Write-Host $gcloudOutput
-                Write-Host "--- End gcloud output capture ---"
-
-                Write-Host "gcloud exited with code: $LASTEXITCODE"
-
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Host "Build completion message published successfully."
-                } else {
-                    Write-Error "gcloud command failed with exit code: $LASTEXITCODE"
-                }
-
-                } catch {
-                    Write-Error "Error publishing build completion message: $($_.Exception.Message)"
-                    # Also output specific error details if available
-                    if ($_.Exception.InnerException) {
-                        Write-Error "Inner exception: $($_.Exception.InnerException.Message)"
-                    }
-                }
-
-            } else {
-                Write-Host "Received unrecognized message: '$messageData'"
             }
-        } else {
-            # Write-Host "No messages received. Waiting..."
-    }
+            Invoke-GCloudPublishMessage -TopicPath $Script:CompletionTopicPath `
+                                        -MessageAttributes $completionAttributes `
+                                        -MessagePayload $completionPayload
 
-    Start-Sleep -Seconds $PollingIntervalSeconds
+        } else {
+            Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
+        }
+    }
+    Start-Sleep -Seconds $Script:PollingIntervalSeconds
 }
