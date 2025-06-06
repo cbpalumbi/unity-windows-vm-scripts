@@ -57,15 +57,17 @@ function Invoke-GCloudPullMessage {
     )
     try {
         Write-Log "Pulling message from Pub/Sub subscription: $SubscriptionPath"
-        $gcloudCommandString = "gcloud pubsub subscriptions pull `"$SubscriptionPath`" --format=json --limit=1 --auto-ack --quiet"
-        #$messagesJson = powershell.exe -NoProfile -Command $gcloudCommandString | Out-String | Trim()
+        # REMOVE --quiet AND ADD --log-http FOR DEBUGGING
+        $gcloudCommandString = "gcloud pubsub subscriptions pull `"$SubscriptionPath`" --format=json --limit=1 --auto-ack" # Removed --quiet
+        Write-Log "Executing gcloud command: $gcloudCommandString" # Added for visibility
         $messagesJson = (powershell.exe -NoProfile -Command $gcloudCommandString | Out-String).Trim()
 
+        Write-Log "Raw gcloud output: $messagesJson" # Log the raw output
 
         if ($messagesJson -like "*ERROR:*") {
             throw "gcloud command failed: $messagesJson"
         }
-        
+
         if (-not ($messagesJson -match '^\s*\[\s*\]\s*$') -and -not [string]::IsNullOrWhiteSpace($messagesJson)) {
             return $messagesJson | ConvertFrom-Json
         } else {
@@ -329,6 +331,8 @@ while (-not (Test-Path $StopFilePath)) {
         } else {
             Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
         }
+    } else {
+        Write-Log "No message received on this pull"
     }
 
     Start-Sleep -Seconds $Script:PollingIntervalSeconds
