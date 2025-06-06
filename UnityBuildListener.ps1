@@ -15,6 +15,16 @@ $Script:CompletionTopicPath = "projects/cool-ruler-461702-p8/topics/unity-build-
 # Use $Script: for global variables to ensure they are accessible within functions and the main loop.
 # This prevents scope issues when the script is run as a service.
 
+
+# --- Stop File Setup for Graceful Exit ---
+$global:StopFilePath = "$env:TEMP\unity_listener_stop.flag"
+
+# Clean up any previous stop file (in case script didn't exit cleanly last time)
+if (Test-Path $StopFilePath) {
+    Remove-Item $StopFilePath -Force
+}
+
+
 # --- Helper Functions ---
 
 function Write-Log {
@@ -219,7 +229,7 @@ Test-AndCreateFolder $Script:BuildOutputBaseFolder
 Write-Log "UnityBuildListener Service Started."
 Write-Log "Listening to Pub/Sub subscription: $Script:SubscriptionPath"
 
-while ($true) {
+while (-not (Test-Path $StopFilePath)) {
     $messages = Invoke-GCloudPullMessage -SubscriptionPath $Script:SubscriptionPath
 
     if ($messages -and $messages.Count -gt 0) {
@@ -320,5 +330,9 @@ while ($true) {
             Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
         }
     }
+
     Start-Sleep -Seconds $Script:PollingIntervalSeconds
 }
+
+Write-Log "Stop file detected at $StopFilePath. Shutting down UnityBuildListener gracefully."
+
