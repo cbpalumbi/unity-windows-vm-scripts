@@ -88,22 +88,37 @@ function Invoke-GCloudPublishMessage {
     )
     try {
         $completionMessagePayloadJson = $MessagePayload | ConvertTo-Json -Compress
-        $escapedPayloadForGcloud = $completionMessagePayloadJson.Replace('"', '\"')
-        $gcloudMessageArg = "--message=`"$escapedPayloadForGcloud`""
+        
+        # No need to escape internal quotes if we pass it as a direct argument
+        # $escapedPayloadForGcloud = $completionMessagePayloadJson.Replace('"', '\"') # This is no longer needed
+        # $gcloudMessageArg = "--message=`"$escapedPayloadForGcloud`"" # This changes
 
-        $attributeArgs = @()
+        # --- IMPORTANT: REPLACE THIS WITH YOUR ACTUAL FULL PATH TO GCLOUD.EXE ---
+        $gcloudExePath = "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud"
+        # --- END OF IMPORTANT REPLACEMENT ---
+
+        # Construct arguments as an array for direct execution
+        $gcloudArgs = @(
+            "pubsub",
+            "topics",
+            "publish",
+            $TopicPath, # TopicPath is a string, PowerShell will quote it if it contains spaces
+            "--message=$completionMessagePayloadJson" # Pass the raw JSON string directly to --message
+        )
+
+        # Add attributes
         foreach ($key in $MessageAttributes.Keys) {
             $value = $MessageAttributes[$key]
-            $attributeArgs += "--attribute=`"$key=$value`""
+            $gcloudArgs += "--attribute=$key=$value" # PowerShell will handle quoting for these too
         }
-        $attributeArgsString = $attributeArgs -join ' '
 
-        $fullGcloudCommandString = "gcloud pubsub topics publish `"$TopicPath`" `"$gcloudMessageArg`" $attributeArgsString"
+        Write-Log "Executing gcloud publish command directly (gcloud.exe):"
+        # For logging, join arguments for display
+        Write-Log "gcloud $($gcloudArgs -join ' ')"
 
-        Write-Log "Executing gcloud publish command via 'cmd /c':"
-        Write-Log $fullGcloudCommandString
-
-        $gcloudOutput = & cmd.exe /c $fullGcloudCommandString 2>&1
+        # Execute the command directly
+        # Capture stderr to stdout using 2>&1
+        $gcloudOutput = & $gcloudExePath @gcloudArgs 2>&1
 
         Write-Log "gcloud publish output: $($gcloudOutput | Out-String)"
         Write-Log "gcloud exited with code: $LASTEXITCODE"
