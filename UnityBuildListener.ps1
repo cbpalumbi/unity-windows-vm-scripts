@@ -11,6 +11,7 @@ $Script:BuildOutputBaseFolder = "C:\Users\unityadmin\Documents\UnityBuilds" # Ba
 $Script:BuildMethod = "BuildScript.PerformBuild" # The method to execute in Unity
 $Script:PollingIntervalSeconds = 5 # How often to poll Pub/Sub for new messages
 $Script:CompletionTopicPath = "projects/cool-ruler-461702-p8/topics/unity-build-completion-topic"
+$Script:GitExePath = "C:\Program Files\Git\bin\git.exe"
 
 # Use $Script: for global variables to ensure they are accessible within functions and the main loop.
 # This prevents scope issues when the script is run as a service.
@@ -145,23 +146,33 @@ function Invoke-GCloudPublishMessage {
 function Invoke-GitOperations {
     param (
         [string]$ProjectPath,
-        [string]$GitReference
+        [string]$BranchName,
+        [string]$CommitHash
     )
     Set-Location $ProjectPath
     try {
-        Write-Log "Fetching latest changes..."
-        #powershell.exe -NoProfile -Command "git fetch --all" | Out-String | Write-Log
-        Write-Log ((powershell.exe -NoProfile -Command "git fetch --all") | Out-String)
+        Write-Log "Fetching all remote branches and tags..."
+        # Using the direct git.exe path for robustness, assuming it's configured
+        # If git.exe is in PATH, you can use & git fetch --all
+        Write-Log ($( & $GitExePath fetch --all 2>&1) | Out-String) # Capture stderr too
 
-        Write-Log "Checking out Git reference: $GitReference"
-        #powershell.exe -NoProfile -Command "git checkout `"$GitReference`"" | Out-String | Write-Log
-        Write-Log ((powershell.exe -NoProfile -Command "git checkout `"$GitReference`"") | Out-String)
+        # Check if the fetched commit actually exists in the local repository
+        Write-Log "Verifying commit hash: $CommitHash"
+        $commitExists = ($( & $GitExePath cat-file -t $CommitHash 2>$null) | Out-String).Trim()
+        if ($commitExists -ne "commit") {
+            throw "Commit '$CommitHash' not found in the repository after fetch. Please ensure it's a valid, reachable commit."
+        }
+        Write-Log "Commit '$CommitHash' verified."
 
-        Write-Log "Pulling latest changes for $GitReference..."
-        #powershell.exe -NoProfile -Command "git pull origin `"$GitReference`"" | Out-String | Write-Log
-        Write-Log ((powershell.exe -NoProfile -Command "git pull origin `"$GitReference`"") | Out-String)
+        Write-Log "Checking out specific commit: $CommitHash"
+        # Directly checkout the full commit hash. This puts the repo in detached HEAD state, which is fine for builds.
+        Write-Log ($( & $GitExePath checkout "$CommitHash" 2>&1) | Out-String)
 
-        Write-Log "Git operations complete."
+        # After checking out a specific commit, you do NOT perform a 'git pull'.
+        # 'git pull' is for merging remote changes into your current branch.
+        # When you checkout a commit, you're at a fixed point in history.
+
+        Write-Log "Git operations complete. Repository is at commit: $CommitHash"
         return $true
     } catch {
         Write-Log "Git operation failed: $($_.Exception.Message)" -Level "ERROR"
@@ -292,22 +303,55 @@ while (-not (Test-Path $StopFilePath)) {
         $finalGcsPath = ""
         $currentBuildOutputFolder = ""
 
-        if ($command -eq "start_build" -or $messageData -like "checkout_and_build") {
-            if ($messageData -like "checkout_and_build") {
-                Write-Log "Request to checkout git commit '$commitHash' and build."
-                if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $commitHash)) {
-                    $buildStatus = "git_failed"
-                    Write-Log "Git operations failed."
-                } else {
-                    Write-Log "Git operations successful."
-                }
+        if ($command -eq "start_build") {
+
+            if (-not (Test-Path $GitExePath)) {
+                $error_msg = "ERROR: Git executable not found at '$GitExePath'. Please verify Git installation. Aborting."
+                Write-Log $error_msg -Level "ERROR"
+                Publish-CompletionMessage $request_id $branch_name $commit_hash $is_test_build $false $null $error_msg
+                continue # Skip to the next message
+            }
+            Write-Log "DEBUG: Git executable '$GitExePath' confirmed to exist."
+
+            Set-Location $UNITY_PROJECT_PATH # Ensure we're in the repo directory
+            $currentHeadCommit = ($( & $GitExePath rev-parse HEAD 2>&1) | Out-String).Trim()
+
+            Write-Log "Current HEAD commit: $currentHeadCommit"
+            Write-Log "Requested commit:    $commitHash"
+
+            if ($currentHeadCommit -eq $commitHash) {
+                Write-Log "Repository is already at the requested commit ($commitHash). Skipping Git operations."
+                # Set a flag to skip the full Git operations call
+                $skipGitOperations = $true
             } else {
-                Write-Log "Triggering standard Unity build (no specific git commit)."
+                Write-Log "Repository needs to change commit. Proceeding with Git operations."
+                $skipGitOperations = $false
             }
 
+            # --- Git Operations ---
+            if (-not $skipGitOperations) {
+                Write-Log "Performing Git checkout..."
+                if (-not (Test-Path $UnityProjectPath)) {
+                    Write-Error "Unity project path '$UnityProjectPath' does not exist."
+                    $error_msg = "Unity project path not found."
+                    throw $error_msg
+                } else {
+                    # Call the updated Invoke-GitOperations function
+                    # Note: Invoke-GitOperations now directly checks out the commit hash.
+                    # The $BranchName parameter is still passed but might not be used
+                    # by the function itself if it prioritizes CommitHash.
+                    $git_success = Invoke-GitOperations -ProjectPath $UNITY_PROJECT_PATH -BranchName $branch_name -CommitHash $commitHash
+                    if (-not $git_success) {
+                        # Invoke-GitOperations already logged the error
+                        throw "Git operations failed during checkout."
+                    }
+                    Write-Log "Git operations complete."
+                }
+            } # End if -not $skipGitOperations
+
             # Determine build output folder name
-            if ($gitRef) {
-                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($gitRef -replace '[^a-zA-Z0-9_.-]', '_')"
+            if ($commitHash) {
+                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($commitHash -replace '[^a-zA-Z0-9_.-]', '_')"
             } else {
                 $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
             }
