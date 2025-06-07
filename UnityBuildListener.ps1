@@ -294,16 +294,15 @@ while (-not (Test-Path $StopFilePath)) {
 
         if ($command -eq "start_build" -or $messageData -like "checkout_and_build") {
             if ($messageData -like "checkout_and_build") {
-                $gitRef = $messageData.Split(":")[1]
-                Write-Log "Request to checkout Git ref '$gitRef' and build."
-                if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $gitRef)) {
+                Write-Log "Request to checkout git commit '$commitHash' and build."
+                if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $commitHash)) {
                     $buildStatus = "git_failed"
-                    Write-Log "Git operations failed. Not attempting Unity build." -Level "ERROR"
+                    Write-Log "Git operations failed."
                 } else {
                     Write-Log "Git operations successful."
                 }
             } else {
-                Write-Log "Triggering standard Unity build (no specific Git ref)."
+                Write-Log "Triggering standard Unity build (no specific git commit)."
             }
 
             # Determine build output folder name
@@ -335,7 +334,7 @@ while (-not (Test-Path $StopFilePath)) {
             if ($buildStatus -eq "success" -or $buildStatus -eq "nobuild") {
                 $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $currentBuildOutputFolder `
                                                         -GCSBucket $Script:GCSBucket `
-                                                        -GCSObjectPrefix "builds/$receivedBuildId/"
+                                                        -GCSObjectPrefix "game-builds/universal/$branchName/$commitHash"
                 if ($uploadSuccess) {
                     $finalGcsPath = $uploadedPath
                 } else {
