@@ -39,8 +39,6 @@ function Write-Log {
     Add-Content -Path $Script:UnityLogFilePath -Value $logEntry
 }
 
-Write-Log "hello test"
-
 function Test-AndCreateFolder {
     param (
         [string]$Path
@@ -258,28 +256,44 @@ while (-not (Test-Path $StopFilePath)) {
     if ($messages -and $messages.Count -gt 0) {
         $message = $messages[0].message
         $decodedBytes = [System.Convert]::FromBase64String($message.data)
-        $messageData = [System.Text.Encoding]::UTF8.GetString($decodedBytes).Trim()
-        Write-Log "Received message data: '$messageData'"
+        $jsonPayloadString = [System.Text.Encoding]::UTF8.GetString($decodedBytes).Trim()
 
-        $receivedBuildId = $message.attributes.build_id
-        if (-not $receivedBuildId) {
-            Write-Log "No build_id found in message attributes. Generating a new one." -Level "WARNING"
-            $receivedBuildId = "unknown_build_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
+        Write-Log "Received raw JSON payload string: '$jsonPayloadString'"
+
+        try {
+            # Convert the JSON string into a PowerShell object
+            $messagePayload = $jsonPayloadString | ConvertFrom-Json
+            Write-Log "Successfully parsed JSON payload."
+        } catch {
+            Write-Log "ERROR: Failed to parse JSON payload. Message: $_" -Level "ERROR"
+            # You might want to acknowledge the message and exit this iteration if parsing fails
+            # This requires access to the message_id ($msg.ackId) earlier in the loop
+            # For now, let's just exit this iteration of the loop
+            continue # Skip to the next message or iteration of the while loop
         }
+
+        # Now access fields directly from the $messagePayload object
+        $receivedBuildId = $messagePayload.build_id
+        $command = $messagePayload.command # If you still use a top-level command string
+        $branchName = $messagePayload.branch_name # New field
+        $commitHash = $messagePayload.commit_hash # New field
+        $isTestBuild = $messagePayload.is_test_build # Accessing the boolean directly
+
+        # Your log messages and conditional checks now use the new variables
         Write-Log "Processing build_id: $receivedBuildId"
+        Write-Log "Received command: '$command'"
+        Write-Log "Received branch_name: '$branchName'"
+        Write-Log "Received commit_hash: '$commitHash'"
+        Write-Log "Is Test Build: $isTestBuild"
 
-        $skipUnityBuild = ($message.attributes.nobuild -eq "true")
-        if ($skipUnityBuild) {
-            Write-Log "NOTE: 'nobuild' flag is 'true'. Unity build will be skipped."
-        }
+        $skipUnityBuild = $isTestBuild
 
         $buildStatus = "failed"
         $finalGcsPath = ""
         $currentBuildOutputFolder = ""
-        $gitRef = $null # Initialize gitRef
 
-        if ($messageData -eq "start_build_for_unityadmin" -or $messageData -like "checkout_and_build:*") {
-            if ($messageData -like "checkout_and_build:*") {
+        if ($command -eq "start_build" -or $messageData -like "checkout_and_build") {
+            if ($messageData -like "checkout_and_build") {
                 $gitRef = $messageData.Split(":")[1]
                 Write-Log "Request to checkout Git ref '$gitRef' and build."
                 if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $gitRef)) {
