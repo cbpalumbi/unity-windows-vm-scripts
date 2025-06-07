@@ -39,6 +39,8 @@ function Write-Log {
     Add-Content -Path $Script:UnityLogFilePath -Value $logEntry
 }
 
+Write-Log "hello test"
+
 function Test-AndCreateFolder {
     param (
         [string]$Path
@@ -237,123 +239,119 @@ function Invoke-GCSUpload {
 }
 
 # --- Main Loop ---
-# This conditional block ensures the main loop only runs when the script is executed directly,
-# not when it's dot-sourced (e.g., by Pester for testing).
-if (-not (Get-Module -ListAvailable -Name Pester)) {
 
-    Test-AndCreateFolder (Split-Path $Script:UnityLogFilePath -Parent)
-    Test-AndCreateFolder $Script:BuildOutputBaseFolder
 
-    Write-Log "UnityBuildListener Service Started."
-    Write-Log "Listening to Pub/Sub subscription: $Script:SubscriptionPath"
+Test-AndCreateFolder (Split-Path $Script:UnityLogFilePath -Parent)
+Test-AndCreateFolder $Script:BuildOutputBaseFolder
 
-    while (-not (Test-Path $StopFilePath)) {
-        $messages = Invoke-GCloudPullMessage -SubscriptionPath $Script:SubscriptionPath
+Write-Log "UnityBuildListener Service Started."
+Write-Log "Listening to Pub/Sub subscription: $Script:SubscriptionPath"
 
-        if ($messages -and $messages.Count -gt 0) {
-            $message = $messages[0].message
-            $decodedBytes = [System.Convert]::FromBase64String($message.data)
-            $messageData = [System.Text.Encoding]::UTF8.GetString($decodedBytes).Trim()
-            Write-Log "Received message data: '$messageData'"
+while (-not (Test-Path $StopFilePath)) {
+    $messages = Invoke-GCloudPullMessage -SubscriptionPath $Script:SubscriptionPath
 
-            $receivedBuildId = $message.attributes.build_id
-            if (-not $receivedBuildId) {
-                Write-Log "No build_id found in message attributes. Generating a new one." -Level "WARNING"
-                $receivedBuildId = "unknown_build_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
-            }
-            Write-Log "Processing build_id: $receivedBuildId"
+    if ($messages -and $messages.Count -gt 0) {
+        $message = $messages[0].message
+        $decodedBytes = [System.Convert]::FromBase64String($message.data)
+        $messageData = [System.Text.Encoding]::UTF8.GetString($decodedBytes).Trim()
+        Write-Log "Received message data: '$messageData'"
 
-            $skipUnityBuild = ($message.attributes.nobuild -eq "true")
-            if ($skipUnityBuild) {
-                Write-Log "NOTE: 'nobuild' flag is 'true'. Unity build will be skipped."
-            }
+        $receivedBuildId = $message.attributes.build_id
+        if (-not $receivedBuildId) {
+            Write-Log "No build_id found in message attributes. Generating a new one." -Level "WARNING"
+            $receivedBuildId = "unknown_build_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
+        }
+        Write-Log "Processing build_id: $receivedBuildId"
 
-            $buildStatus = "failed"
-            $finalGcsPath = ""
-            $currentBuildOutputFolder = ""
-            $gitRef = $null # Initialize gitRef
-
-            if ($messageData -eq "start_build_for_unityadmin" -or $messageData -like "checkout_and_build:*") {
-                if ($messageData -like "checkout_and_build:*") {
-                    $gitRef = $messageData.Split(":")[1]
-                    Write-Log "Request to checkout Git ref '$gitRef' and build."
-                    if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $gitRef)) {
-                        $buildStatus = "git_failed"
-                        Write-Log "Git operations failed. Not attempting Unity build." -Level "ERROR"
-                    } else {
-                        Write-Log "Git operations successful."
-                    }
-                } else {
-                    Write-Log "Triggering standard Unity build (no specific Git ref)."
-                }
-
-                # Determine build output folder name
-                if ($gitRef) {
-                    $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($gitRef -replace '[^a-zA-Z0-9_.-]', '_')"
-                } else {
-                    $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                }
-
-                if ($buildStatus -ne "git_failed") { # Only attempt Unity build if Git ops succeeded or not applicable
-                    if ($skipUnityBuild) {
-                        Write-Log "Skipping actual Unity build based on --nobuild flag."
-                        $buildStatus = "nobuild"
-                    } else {
-                        Write-Log "Proceeding with actual Unity build..."
-                        if (Invoke-UnityBuild -UnityEditorPath $Script:UnityEditorPath `
-                                            -UnityProjectPath $Script:UnityProjectPath `
-                                            -UnityLogFilePath $Script:UnityLogFilePath `
-                                            -BuildMethod $Script:BuildMethod `
-                                            -BuildOutputFolder $currentBuildOutputFolder) {
-                            $buildStatus = "success"
-                        } else {
-                            $buildStatus = "unity_build_failed"
-                        }
-                    }
-                }
-
-                # Upload artifacts if the build (or no-build) was processed and a folder was created
-                if ($buildStatus -eq "success" -or $buildStatus -eq "nobuild") {
-                    $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $currentBuildOutputFolder `
-                                                            -GCSBucket $Script:GCSBucket `
-                                                            -GCSObjectPrefix "builds/$receivedBuildId/"
-                    if ($uploadSuccess) {
-                        $finalGcsPath = $uploadedPath
-                    } else {
-                        $buildStatus = "upload_failed"
-                        Write-Log "GCS upload failed." -Level "ERROR"
-                    }
-                } else {
-                    Write-Log "Skipping GCS upload due to build status: $buildStatus"
-                }
-
-                # Publish completion message
-                $completionAttributes = @{
-                    build_id = $receivedBuildId
-                    status = $buildStatus
-                    # Add session_id if you extract it from the incoming message
-                    # For now, it's a placeholder
-                    session_id = "placeholder"
-                }
-                $completionPayload = @{
-                    message = "Build completed for $receivedBuildId"
-                    gcs_path = $finalGcsPath
-                    timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
-                }
-                Invoke-GCloudPublishMessage -TopicPath $Script:CompletionTopicPath `
-                                            -MessageAttributes $completionAttributes `
-                                            -MessagePayload $completionPayload
-
-            } else {
-                Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
-            }
-        } else {
-            Write-Log "No message received on this pull"
+        $skipUnityBuild = ($message.attributes.nobuild -eq "true")
+        if ($skipUnityBuild) {
+            Write-Log "NOTE: 'nobuild' flag is 'true'. Unity build will be skipped."
         }
 
-        Start-Sleep -Seconds $Script:PollingIntervalSeconds
+        $buildStatus = "failed"
+        $finalGcsPath = ""
+        $currentBuildOutputFolder = ""
+        $gitRef = $null # Initialize gitRef
+
+        if ($messageData -eq "start_build_for_unityadmin" -or $messageData -like "checkout_and_build:*") {
+            if ($messageData -like "checkout_and_build:*") {
+                $gitRef = $messageData.Split(":")[1]
+                Write-Log "Request to checkout Git ref '$gitRef' and build."
+                if (-not (Invoke-GitOperations -ProjectPath $Script:UnityProjectPath -GitReference $gitRef)) {
+                    $buildStatus = "git_failed"
+                    Write-Log "Git operations failed. Not attempting Unity build." -Level "ERROR"
+                } else {
+                    Write-Log "Git operations successful."
+                }
+            } else {
+                Write-Log "Triggering standard Unity build (no specific Git ref)."
+            }
+
+            # Determine build output folder name
+            if ($gitRef) {
+                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($gitRef -replace '[^a-zA-Z0-9_.-]', '_')"
+            } else {
+                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            }
+
+            if ($buildStatus -ne "git_failed") { # Only attempt Unity build if Git ops succeeded or not applicable
+                if ($skipUnityBuild) {
+                    Write-Log "Skipping actual Unity build based on --nobuild flag."
+                    $buildStatus = "nobuild"
+                } else {
+                    Write-Log "Proceeding with actual Unity build..."
+                    if (Invoke-UnityBuild -UnityEditorPath $Script:UnityEditorPath `
+                                        -UnityProjectPath $Script:UnityProjectPath `
+                                        -UnityLogFilePath $Script:UnityLogFilePath `
+                                        -BuildMethod $Script:BuildMethod `
+                                        -BuildOutputFolder $currentBuildOutputFolder) {
+                        $buildStatus = "success"
+                    } else {
+                        $buildStatus = "unity_build_failed"
+                    }
+                }
+            }
+
+            # Upload artifacts if the build (or no-build) was processed and a folder was created
+            if ($buildStatus -eq "success" -or $buildStatus -eq "nobuild") {
+                $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $currentBuildOutputFolder `
+                                                        -GCSBucket $Script:GCSBucket `
+                                                        -GCSObjectPrefix "builds/$receivedBuildId/"
+                if ($uploadSuccess) {
+                    $finalGcsPath = $uploadedPath
+                } else {
+                    $buildStatus = "upload_failed"
+                    Write-Log "GCS upload failed." -Level "ERROR"
+                }
+            } else {
+                Write-Log "Skipping GCS upload due to build status: $buildStatus"
+            }
+
+            # Publish completion message
+            $completionAttributes = @{
+                build_id = $receivedBuildId
+                status = $buildStatus
+                # Add session_id if you extract it from the incoming message
+                # For now, it's a placeholder
+                session_id = "placeholder"
+            }
+            $completionPayload = @{
+                message = "Build completed for $receivedBuildId"
+                gcs_path = $finalGcsPath
+                timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
+            }
+            Invoke-GCloudPublishMessage -TopicPath $Script:CompletionTopicPath `
+                                        -MessageAttributes $completionAttributes `
+                                        -MessagePayload $completionPayload
+
+        } else {
+            Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
+        }
+    } else {
+        Write-Log "No message received on this pull"
     }
 
-    Write-Log "Stop file detected at $StopFilePath. Shutting down UnityBuildListener gracefully."
-
+    Start-Sleep -Seconds $Script:PollingIntervalSeconds
 }
+
+Write-Log "Stop file detected at $StopFilePath. Shutting down UnityBuildListener gracefully."
