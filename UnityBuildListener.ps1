@@ -89,33 +89,37 @@ function Invoke-GCloudPublishMessage {
         [hashtable]$MessagePayload
     )
     try {
+        # 1. Convert the PowerShell Hashtable to a JSON string.
+        #    -Compress removes unnecessary whitespace, which is good for CLI args.
         $completionMessagePayloadJson = $MessagePayload | ConvertTo-Json -Compress
-        
-        # No need to escape internal quotes if we pass it as a direct argument
-        # $escapedPayloadForGcloud = $completionMessagePayloadJson.Replace('"', '\"') # This is no longer needed
-        # $gcloudMessageArg = "--message=`"$escapedPayloadForGcloud`"" # This changes
+
+        # 2. Encode the JSON string to Base64
+        #    This converts the JSON text into a safe, ASCII-only string of characters.
+        $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($completionMessagePayloadJson)
+        $base64EncodedMessage = [System.Convert]::ToBase64String($jsonBytes)
 
         # --- IMPORTANT: REPLACE THIS WITH YOUR ACTUAL FULL PATH TO GCLOUD.EXE ---
         $gcloudExePath = "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud"
         # --- END OF IMPORTANT REPLACEMENT ---
 
-        # Construct arguments as an array for direct execution
+        # Construct arguments as an array for direct execution.
+        # Pass the Base64 encoded string as the message.
         $gcloudArgs = @(
             "pubsub",
             "topics",
             "publish",
             $TopicPath, # TopicPath is a string, PowerShell will quote it if it contains spaces
-            "--message=$completionMessagePayloadJson" # Pass the raw JSON string directly to --message
+            "--message=$base64EncodedMessage" # This is the key change!
         )
 
-        # Add attributes
+        # Add attributes (these are simpler key=value pairs, already handled correctly)
         foreach ($key in $MessageAttributes.Keys) {
             $value = $MessageAttributes[$key]
-            $gcloudArgs += "--attribute=$key=$value" # PowerShell will handle quoting for these too
+            $gcloudArgs += "--attribute=$key=$value"
         }
 
         Write-Log "Executing gcloud publish command directly (gcloud.exe):"
-        # For logging, join arguments for display
+        # For logging, join arguments for display (this will now show the Base64 string)
         Write-Log "gcloud $($gcloudArgs -join ' ')"
 
         # Execute the command directly
@@ -138,6 +142,7 @@ function Invoke-GCloudPublishMessage {
         return $false
     }
 }
+
 
 function Invoke-GitOperations {
     param (
