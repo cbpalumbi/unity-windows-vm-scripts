@@ -334,7 +334,7 @@ while (-not (Test-Path $StopFilePath)) {
             if ($buildStatus -eq "success" -or $buildStatus -eq "nobuild") {
                 $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $currentBuildOutputFolder `
                                                         -GCSBucket $Script:GCSBucket `
-                                                        -GCSObjectPrefix "game-builds/universal/$branchName/$commitHash"
+                                                        -GCSObjectPrefix "game-builds/universal/$branchName/$commitHash/"
                 if ($uploadSuccess) {
                     $finalGcsPath = $uploadedPath
                 } else {
