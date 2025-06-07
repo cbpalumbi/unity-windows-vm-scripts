@@ -344,6 +344,7 @@ while (-not (Test-Path $StopFilePath)) {
                 message = "Build completed for $receivedBuildId"
                 gcs_path = $finalGcsPath
                 timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
+                build_id = $receivedBuildId
             }
             Invoke-GCloudPublishMessage -TopicPath $Script:CompletionTopicPath `
                                         -MessageAttributes $completionAttributes `
