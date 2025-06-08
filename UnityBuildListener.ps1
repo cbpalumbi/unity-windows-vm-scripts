@@ -143,40 +143,91 @@ function Invoke-GCloudPublishMessage {
 }
 
 
+# In your Invoke-GitOperations function, around the commit validation
 function Invoke-GitOperations {
     param (
-        [string]$ProjectPath,
         [string]$BranchName,
         [string]$CommitHash
     )
-    Set-Location $ProjectPath
+    Set-Location $UnityProjectPath -ErrorAction Stop
+
     try {
-        Write-Log "Fetching all remote branches and tags..."
-        # Using the direct git.exe path for robustness, assuming it's configured
-        # If git.exe is in PATH, you can use & git fetch --all
-        Write-Log ($( & $GitExePath fetch --all 2>&1) | Out-String) # Capture stderr too
+        Write-Log "DEBUG (GitOps): Starting Git operations for CommitHash: $CommitHash on branch: $BranchName"
+        #Write-Log "DEBUG (GitOps): Current working directory: $(Get-Location)"
+        #Write-Log "DEBUG (GitOps): Git executable path: $GitExePath"
 
-        # Check if the fetched commit actually exists in the local repository
-        Write-Log "Verifying commit hash: $CommitHash"
-        $commitExists = ($( & $GitExePath cat-file -t $CommitHash 2>$null) | Out-String).Trim()
-        if ($commitExists -ne "commit") {
-            throw "Commit '$CommitHash' not found in the repository after fetch. Please ensure it's a valid, reachable commit."
+        # --- Step 1: Fetch all to ensure local knowledge of remote state ---
+        Write-Log "DEBUG (GitOps): Performing 'git fetch --all'..."
+        $fetchOutputLines = & $GitExePath fetch --all 2>&1
+        Write-Log "DEBUG (GitOps): Raw 'git fetch --all' output (length: $($fetchOutputLines.Count) lines):" # Use .Count for array
+        Write-Log "--------------------------------------------------------"
+        Write-Log (($fetchOutputLines | Out-String).Trim())
+        Write-Log "--------------------------------------------------------"
+        if ($LASTEXITCODE -ne 0) { throw "Git fetch --all failed with exit code $LASTEXITCODE." }
+        Write-Log "INFO (GitOps): Git fetch completed. (No output means no new changes)."
+
+        # --- Step 2: Check if the requested commit exists locally after the fetch ---
+        Write-Log "INFO (GitOps): Verifying requested commit hash '$CommitHash' locally..."
+        $catFileResultLines = & $GitExePath cat-file -t $CommitHash 2>&1
+        $catFileExitCode = $LASTEXITCODE # Capture exit code immediately
+
+        Write-Log "DEBUG (GitOps): Raw 'git cat-file -t' output (length: $($catFileResultLines.Count) lines):"
+        Write-Log "--------------------------------------------------------"
+        Write-Log (($catFileResultLines | Out-String).Trim())
+        Write-Log "--------------------------------------------------------"
+
+        if ($catFileExitCode -ne 0 -or (($catFileResultLines | Out-String).Trim() -ne "commit")) {
+            # Commit not found or not a 'commit' object locally.
+            # This is where we might need to be more aggressive or fail.
+            Write-Log "WARNING (GitOps): Commit '$CommitHash' not found or is not a commit object locally after fetch. Attempting 'git pull --ff-only' on branch '$BranchName' to bring it in." -Level "WARN"
+
+            # --- Step 3: If commit isn't local, try to pull the target branch ---
+            # Checkout the target branch first to ensure we are on it for the pull
+            Write-Log "DEBUG (GitOps): Checking out local branch '$BranchName' for pull attempt..."
+            $checkoutBranchOutput = & $GitExePath checkout $BranchName 2>&1
+            Write-Log (($checkoutBranchOutput | Out-String).Trim())
+            if ($LASTEXITCODE -ne 0) { throw "Failed to checkout branch '$BranchName' before pull: $LASTEXITCODE." }
+
+            # Perform a pull to update the current branch.
+            # --ff-only ensures it only fast-forwards, avoiding merge conflicts if script is re-run.
+            Write-Log "DEBUG (GitOps): Performing 'git pull --ff-only origin $BranchName'..."
+            $pullOutputLines = & $GitExePath pull --ff-only origin $BranchName 2>&1
+            Write-Log "DEBUG (GitOps): Raw 'git pull' output (length: $($pullOutputLines.Count) lines):"
+            Write-Log "--------------------------------------------------------"
+            Write-Log (($pullOutputLines | Out-String).Trim())
+            Write-Log "--------------------------------------------------------"
+            if ($LASTEXITCODE -ne 0) { throw "Git pull --ff-only origin $BranchName failed with exit code $LASTEXITCODE. This might mean your local branch '$BranchName' has diverge from origin/$BranchName or the requested commit is not on this branch." }
+            Write-Log "INFO (GitOps): Git pull completed successfully."
+
+            # Re-check if the commit exists after the pull
+            Write-Log "INFO (GitOps): Re-verifying requested commit hash '$CommitHash' after pull..."
+            $catFileResultLines = & $GitExePath cat-file -t $CommitHash 2>&1
+            $catFileExitCode = $LASTEXITCODE
+            $commitExists = (($catFileResultLines | Out-String).Trim())
+
+            if ($catFileExitCode -ne 0 -or ($commitExists -ne "commit")) {
+                throw "Commit '$CommitHash' still not found or is not a commit object after fetch and pull. This indicates a problem with the commit itself or the repository state (e.g., shallow clone, commit not on '$BranchName' remote branch)."
+            }
+            Write-Log "INFO (GitOps): Commit '$CommitHash' verified as a valid commit object after pull."
+
+        } else {
+            Write-Log "INFO (GitOps): Commit '$CommitHash' already exists locally and is a valid commit object."
         }
-        Write-Log "Commit '$CommitHash' verified."
 
-        Write-Log "Checking out specific commit: $CommitHash"
-        # Directly checkout the full commit hash. This puts the repo in detached HEAD state, which is fine for builds.
-        Write-Log ($( & $GitExePath checkout "$CommitHash" 2>&1) | Out-String)
+        # --- Step 4: Checkout the specific commit ---
+        Write-Log "INFO (GitOps): Checking out specific commit: $CommitHash"
+        $checkoutCommitOutput = & $GitExePath checkout "$CommitHash" 2>&1
+        #Write-Log (($checkoutCommitOutput | Out-String).Trim())
 
-        # After checking out a specific commit, you do NOT perform a 'git pull'.
-        # 'git pull' is for merging remote changes into your current branch.
-        # When you checkout a commit, you're at a fixed point in history.
-
-        Write-Log "Git operations complete. Repository is at commit: $CommitHash"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Git checkout $CommitHash failed with exit code $LASTEXITCODE. Ensure the commit is reachable and valid."
+        }
+        Write-Log "INFO (GitOps): Git operations complete. Repository is now at commit: $CommitHash"
         return $true
+
     } catch {
-        Write-Log "Git operation failed: $($_.Exception.Message)" -Level "ERROR"
-        Write-Log "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)" -Level "ERROR"
+        Write-Log "ERROR (GitOps): Git operation failed: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "ERROR (GitOps): Line: $($_.InvocationInfo.ScriptLineNumber), Position: $($_.InvocationInfo.ScriptPosition)" -Level "ERROR"
         return $false
     }
 }
@@ -308,7 +359,7 @@ while (-not (Test-Path $StopFilePath)) {
             if (-not (Test-Path $GitExePath)) {
                 $error_msg = "ERROR: Git executable not found at '$GitExePath'. Please verify Git installation. Aborting."
                 Write-Log $error_msg -Level "ERROR"
-                Publish-CompletionMessage $request_id $branch_name $commit_hash $is_test_build $false $null $error_msg
+                #Publish-CompletionMessage $receivedBuildId $branchName $commitHash $isTestBuild $false $null $error_msg
                 continue # Skip to the next message
             }
             Write-Log "DEBUG: Git executable '$GitExePath' confirmed to exist."
@@ -340,7 +391,7 @@ while (-not (Test-Path $StopFilePath)) {
                     # Note: Invoke-GitOperations now directly checks out the commit hash.
                     # The $BranchName parameter is still passed but might not be used
                     # by the function itself if it prioritizes CommitHash.
-                    $git_success = Invoke-GitOperations -ProjectPath $UNITY_PROJECT_PATH -BranchName $branch_name -CommitHash $commitHash
+                    $git_success = Invoke-GitOperations -BranchName $branchName -CommitHash $commitHash
                     if (-not $git_success) {
                         # Invoke-GitOperations already logged the error
                         throw "Git operations failed during checkout."
