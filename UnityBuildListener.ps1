@@ -124,7 +124,7 @@ function Invoke-GCloudPublishMessage {
 
         # Execute the command directly
         # Capture stderr to stdout using 2>&1
-        $gcloudOutput = & $gcloudExePath @gcloudArgs 2>&1
+        $gcloudOutput = & $gcloudExePath @gcloudArgs *>&1
 
         if ($DebugLogs) {Write-Log "gcloud publish output: $($gcloudOutput | Out-String)"}
         if ($DebugLogs) {Write-Log "gcloud exited with code: $LASTEXITCODE"}
@@ -290,7 +290,7 @@ function Invoke-GCSUpload {
         # Upload directory content
         $gsutilCommandStringDir = "gsutil cp -r `"$LocalPath\*`" `"$finalGcsPath`""
         #powershell.exe -NoProfile -Command $gsutilCommandStringDir | Out-String | Write-Log
-        Write-Log ((powershell.exe -NoProfile -Command $gsutilCommandStringDir) | Out-String)
+        if ($DebugLogs) {Write-Log ((powershell.exe -NoProfile -Command $gsutilCommandStringDir) | Out-String)}
 
 
         # Upload specific log file if it's outside the directory
@@ -478,6 +478,8 @@ while (-not (Test-Path $StopFilePath)) {
             Invoke-GCloudPublishMessage -TopicPath $Script:CompletionTopicPath `
                                         -MessageAttributes $completionAttributes `
                                         -MessagePayload $completionPayload
+
+            Write-Log "--------------------------------------------------------"
 
         } else {
             Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
