@@ -20,6 +20,8 @@ $Script:GitExePath = "C:\Program Files\Git\bin\git.exe"
 # --- Stop File Setup for Graceful Exit ---
 $global:StopFilePath = "$env:TEMP\unity_listener_stop.flag"
 
+$Script:DebugLogs = $false
+
 # Clean up any previous stop file (in case script didn't exit cleanly last time)
 if (Test-Path $StopFilePath) {
     Remove-Item $StopFilePath -Force
@@ -46,9 +48,9 @@ function Test-AndCreateFolder {
     if (-not (Test-Path $Path)) {
         Write-Log "Creating folder: $Path"
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
-        return $true
+        #return $true
     }
-    return $false
+    #return $false
 }
 
 function Invoke-GCloudPullMessage {
@@ -56,13 +58,14 @@ function Invoke-GCloudPullMessage {
         [string]$SubscriptionPath
     )
     try {
-        Write-Log "Pulling message from Pub/Sub subscription: $SubscriptionPath"
-        # REMOVE --quiet AND ADD --log-http FOR DEBUGGING
-        $gcloudCommandString = "gcloud pubsub subscriptions pull `"$SubscriptionPath`" --format=json --limit=1 --auto-ack" # Removed --quiet
-        Write-Log "Executing gcloud command: $gcloudCommandString" # Added for visibility
+        
+        if ($DebugLogs) {Write-Log "Pulling message from Pub/Sub subscription: $SubscriptionPath"}
+        # --quiet,  --log-http FOR DEBUGGING
+        $gcloudCommandString = "gcloud pubsub subscriptions pull `"$SubscriptionPath`" --format=json --limit=1 --auto-ack" 
+        if ($DebugLogs) {Write-Log "Executing gcloud command: $gcloudCommandString"} 
         $messagesJson = (powershell.exe -NoProfile -Command $gcloudCommandString | Out-String).Trim()
 
-        Write-Log "Raw gcloud output: $messagesJson" # Log the raw output
+        if ($DebugLogs) {Write-Log "Raw gcloud output: $messagesJson"} # Log the raw output
 
         if ($messagesJson -like "*ERROR:*") {
             throw "gcloud command failed: $messagesJson"
@@ -116,16 +119,15 @@ function Invoke-GCloudPublishMessage {
             $gcloudArgs += "--attribute=$key=$value"
         }
 
-        Write-Log "Executing gcloud publish command directly (gcloud.exe):"
-        # For logging, join arguments for display (this will now show the Base64 string)
-        Write-Log "gcloud $($gcloudArgs -join ' ')"
+        if ($DebugLogs) {Write-Log "Executing gcloud publish command directly (gcloud.exe):"}
+        if ($DebugLogs) {Write-Log "gcloud $($gcloudArgs -join ' ')"}
 
         # Execute the command directly
         # Capture stderr to stdout using 2>&1
         $gcloudOutput = & $gcloudExePath @gcloudArgs 2>&1
 
-        Write-Log "gcloud publish output: $($gcloudOutput | Out-String)"
-        Write-Log "gcloud exited with code: $LASTEXITCODE"
+        if ($DebugLogs) {Write-Log "gcloud publish output: $($gcloudOutput | Out-String)"}
+        if ($DebugLogs) {Write-Log "gcloud exited with code: $LASTEXITCODE"}
 
         if ($LASTEXITCODE -ne 0) {
             throw "gcloud command failed with exit code: $LASTEXITCODE"
@@ -156,50 +158,56 @@ function Invoke-GitOperations {
         #Write-Log "DEBUG (GitOps): Git executable path: $GitExePath"
 
         # --- Step 1: Fetch all to ensure local knowledge of remote state ---
-        Write-Log "DEBUG (GitOps): Performing 'git fetch --all'..."
+        if ($DebugLogs) {Write-Log "DEBUG (GitOps): Performing 'git fetch --all'..."}
         $fetchOutputLines = & $GitExePath fetch --all 2>&1
-        Write-Log "DEBUG (GitOps): Raw 'git fetch --all' output (length: $($fetchOutputLines.Count) lines):" # Use .Count for array
-        Write-Log "--------------------------------------------------------"
-        Write-Log (($fetchOutputLines | Out-String).Trim())
-        Write-Log "--------------------------------------------------------"
+        if ($DebugLogs) {
+            Write-Log "DEBUG (GitOps): Raw 'git fetch --all' output (length: $($fetchOutputLines.Count) lines):" # Use .Count for array
+            Write-Log "--------------------------------------------------------"
+            Write-Log (($fetchOutputLines | Out-String).Trim())
+            Write-Log "--------------------------------------------------------"
+        }
         if ($LASTEXITCODE -ne 0) { throw "Git fetch --all failed with exit code $LASTEXITCODE." }
-        Write-Log "INFO (GitOps): Git fetch completed. (No output means no new changes)."
+        if ($DebugLogs) {Write-Log "INFO (GitOps): Git fetch completed. (No output means no new changes)."}
 
         # --- Step 2: Check if the requested commit exists locally after the fetch ---
         Write-Log "INFO (GitOps): Verifying requested commit hash '$CommitHash' locally..."
         $catFileResultLines = & $GitExePath cat-file -t $CommitHash 2>&1
         $catFileExitCode = $LASTEXITCODE # Capture exit code immediately
 
-        Write-Log "DEBUG (GitOps): Raw 'git cat-file -t' output (length: $($catFileResultLines.Count) lines):"
-        Write-Log "--------------------------------------------------------"
-        Write-Log (($catFileResultLines | Out-String).Trim())
-        Write-Log "--------------------------------------------------------"
+        if ($DebugLogs) {
+            Write-Log "DEBUG (GitOps): Raw 'git cat-file -t' output (length: $($catFileResultLines.Count) lines):"
+            Write-Log "--------------------------------------------------------"
+            Write-Log (($catFileResultLines | Out-String).Trim())
+            Write-Log "--------------------------------------------------------"
+        }
 
         if ($catFileExitCode -ne 0 -or (($catFileResultLines | Out-String).Trim() -ne "commit")) {
             # Commit not found or not a 'commit' object locally.
             # This is where we might need to be more aggressive or fail.
-            Write-Log "WARNING (GitOps): Commit '$CommitHash' not found or is not a commit object locally after fetch. Attempting 'git pull --ff-only' on branch '$BranchName' to bring it in." -Level "WARN"
+            if ($DebugLogs) {Write-Log "WARNING (GitOps): Commit '$CommitHash' not found or is not a commit object locally after fetch. Attempting 'git pull --ff-only' on branch '$BranchName' to bring it in." -Level "WARN"}
 
             # --- Step 3: If commit isn't local, try to pull the target branch ---
             # Checkout the target branch first to ensure we are on it for the pull
             Write-Log "DEBUG (GitOps): Checking out local branch '$BranchName' for pull attempt..."
             $checkoutBranchOutput = & $GitExePath checkout $BranchName 2>&1
-            Write-Log (($checkoutBranchOutput | Out-String).Trim())
+            if ($DebugLogs) {Write-Log (($checkoutBranchOutput | Out-String).Trim())}
             if ($LASTEXITCODE -ne 0) { throw "Failed to checkout branch '$BranchName' before pull: $LASTEXITCODE." }
 
             # Perform a pull to update the current branch.
             # --ff-only ensures it only fast-forwards, avoiding merge conflicts if script is re-run.
-            Write-Log "DEBUG (GitOps): Performing 'git pull --ff-only origin $BranchName'..."
+            if ($DebugLogs) {Write-Log "DEBUG (GitOps): Performing 'git pull --ff-only origin $BranchName'..."}
             $pullOutputLines = & $GitExePath pull --ff-only origin $BranchName 2>&1
-            Write-Log "DEBUG (GitOps): Raw 'git pull' output (length: $($pullOutputLines.Count) lines):"
-            Write-Log "--------------------------------------------------------"
-            Write-Log (($pullOutputLines | Out-String).Trim())
-            Write-Log "--------------------------------------------------------"
+            if ($DebugLogs) {
+                Write-Log "DEBUG (GitOps): Raw 'git pull' output (length: $($pullOutputLines.Count) lines):"
+                Write-Log "--------------------------------------------------------"
+                Write-Log (($pullOutputLines | Out-String).Trim())
+                Write-Log "--------------------------------------------------------"
+            }
             if ($LASTEXITCODE -ne 0) { throw "Git pull --ff-only origin $BranchName failed with exit code $LASTEXITCODE. This might mean your local branch '$BranchName' has diverge from origin/$BranchName or the requested commit is not on this branch." }
-            Write-Log "INFO (GitOps): Git pull completed successfully."
+            if ($DebugLogs) {Write-Log "INFO (GitOps): Git pull completed successfully."}
 
             # Re-check if the commit exists after the pull
-            Write-Log "INFO (GitOps): Re-verifying requested commit hash '$CommitHash' after pull..."
+            if ($DebugLogs) {Write-Log "INFO (GitOps): Re-verifying requested commit hash '$CommitHash' after pull..."}
             $catFileResultLines = & $GitExePath cat-file -t $CommitHash 2>&1
             $catFileExitCode = $LASTEXITCODE
             $commitExists = (($catFileResultLines | Out-String).Trim())
@@ -207,14 +215,14 @@ function Invoke-GitOperations {
             if ($catFileExitCode -ne 0 -or ($commitExists -ne "commit")) {
                 throw "Commit '$CommitHash' still not found or is not a commit object after fetch and pull. This indicates a problem with the commit itself or the repository state (e.g., shallow clone, commit not on '$BranchName' remote branch)."
             }
-            Write-Log "INFO (GitOps): Commit '$CommitHash' verified as a valid commit object after pull."
+            if ($DebugLogs) {Write-Log "INFO (GitOps): Commit '$CommitHash' verified as a valid commit object after pull."}
 
         } else {
             Write-Log "INFO (GitOps): Commit '$CommitHash' already exists locally and is a valid commit object."
         }
 
         # --- Step 4: Checkout the specific commit ---
-        Write-Log "INFO (GitOps): Checking out specific commit: $CommitHash"
+        if ($DebugLogs) {Write-Log "INFO (GitOps): Checking out specific commit: $CommitHash"}
         $checkoutCommitOutput = & $GitExePath checkout "$CommitHash" 2>&1
         #Write-Log (($checkoutCommitOutput | Out-String).Trim())
 
@@ -289,7 +297,7 @@ function Invoke-GCSUpload {
         if ($LocalPath -ne $Script:UnityLogFilePath) { # Avoid double upload if log is inside
             $gsutilLogCommandString = "gsutil cp `"$Script:UnityLogFilePath`" `"$finalGcsPath`""
             #powershell.exe -NoProfile -Command $gsutilLogCommandString | Out-String | Write-Log
-            Write-Log ((powershell.exe -NoProfile -Command $gsutilLogCommandString) | Out-String)
+            if ($DebugLogs) {Write-Log ((powershell.exe -NoProfile -Command $gsutilLogCommandString) | Out-String)}
 
         }
 
@@ -336,7 +344,7 @@ while (-not (Test-Path $StopFilePath)) {
         try {
             # Convert the JSON string into a PowerShell object
             $messagePayload = $jsonPayloadString | ConvertFrom-Json
-            Write-Log "Successfully parsed JSON payload."
+            if ($DebugLogs) {Write-Log "Successfully parsed JSON payload."}
         } catch {
             Write-Log "ERROR: Failed to parse JSON payload. Message: $_" -Level "ERROR"
             # You might want to acknowledge the message and exit this iteration if parsing fails
@@ -353,11 +361,13 @@ while (-not (Test-Path $StopFilePath)) {
         $isTestBuild = $messagePayload.is_test_build # Accessing the boolean directly
 
         # Your log messages and conditional checks now use the new variables
-        Write-Log "Processing build_id: $receivedBuildId"
-        Write-Log "Received command: '$command'"
-        Write-Log "Received branch_name: '$branchName'"
-        Write-Log "Received commit_hash: '$commitHash'"
-        Write-Log "Is Test Build: $isTestBuild"
+        if ($DebugLogs) {
+            Write-Log "Processing build_id: $receivedBuildId"
+            Write-Log "Received command: '$command'"
+            Write-Log "Received branch_name: '$branchName'"
+            Write-Log "Received commit_hash: '$commitHash'"
+            Write-Log "Is Test Build: $isTestBuild"
+        }
 
         $skipUnityBuild = $isTestBuild
 
@@ -373,13 +383,13 @@ while (-not (Test-Path $StopFilePath)) {
                 #Publish-CompletionMessage $receivedBuildId $branchName $commitHash $isTestBuild $false $null $error_msg
                 continue # Skip to the next message
             }
-            Write-Log "DEBUG: Git executable '$GitExePath' confirmed to exist."
+            if ($DebugLogs) {Write-Log "DEBUG: Git executable '$GitExePath' confirmed to exist."}
 
             Set-Location $UNITY_PROJECT_PATH # Ensure we're in the repo directory
             $currentHeadCommit = ($( & $GitExePath rev-parse HEAD 2>&1) | Out-String).Trim()
 
-            Write-Log "Current HEAD commit: $currentHeadCommit"
-            Write-Log "Requested commit:    $commitHash"
+            if ($DebugLogs) {Write-Log "Current HEAD commit: $currentHeadCommit"}
+            if ($DebugLogs) {Write-Log "Requested commit:    $commitHash"}
 
             if ($currentHeadCommit -eq $commitHash) {
                 Write-Log "Repository is already at the requested commit ($commitHash). Skipping Git operations."
@@ -392,7 +402,7 @@ while (-not (Test-Path $StopFilePath)) {
 
             # --- Git Operations ---
             if (-not $skipGitOperations) {
-                Write-Log "Performing Git checkout..."
+                if ($DebugLogs) {Write-Log "Performing Git checkout..."}
                 if (-not (Test-Path $UnityProjectPath)) {
                     Write-Error "Unity project path '$UnityProjectPath' does not exist."
                     $error_msg = "Unity project path not found."
@@ -473,7 +483,7 @@ while (-not (Test-Path $StopFilePath)) {
             Write-Log "Received unrecognized message: '$messageData'" -Level "WARNING"
         }
     } else {
-        Write-Log "No message received on this pull"
+        if ($DebugLogs) {Write-Log "No message received on this pull"}
     }
 
     Start-Sleep -Seconds $Script:PollingIntervalSeconds
