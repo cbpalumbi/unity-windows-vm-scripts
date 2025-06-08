@@ -25,7 +25,6 @@ if (Test-Path $StopFilePath) {
     Remove-Item $StopFilePath -Force
 }
 
-
 # --- Helper Functions ---
 
 function Write-Log {
@@ -305,11 +304,23 @@ function Invoke-GCSUpload {
 
 # --- Main Loop ---
 
+Write-Log "UnityBuildListener Service Started."
+
+try {
+    # Attempt to change directory, forcing a terminating error on failure
+    Set-Location $UnityProjectPath -ErrorAction Stop
+} catch {
+    # If Set-Location failed, log the error and exit
+    $errorMessage = "FATAL ERROR: Failed to set working directory to '$UnityProjectPath'. Details: $($_.Exception.Message)"
+    Write-Log $errorMessage -Level "FATAL"
+
+    # Exit the script with a non-zero exit code to signal failure
+    exit 1
+}
 
 Test-AndCreateFolder (Split-Path $Script:UnityLogFilePath -Parent)
 Test-AndCreateFolder $Script:BuildOutputBaseFolder
 
-Write-Log "UnityBuildListener Service Started."
 Write-Log "Listening to Pub/Sub subscription: $Script:SubscriptionPath"
 
 while (-not (Test-Path $StopFilePath)) {
