@@ -124,7 +124,7 @@ function Invoke-GCloudPublishMessage {
 
         # Execute the command directly
         # Capture stderr to stdout using 2>&1
-        $gcloudOutput = & $gcloudExePath @gcloudArgs *>&1
+        $gcloudOutput = & $gcloudExePath @gcloudArgs 2>&1
 
         if ($DebugLogs) {Write-Log "gcloud publish output: $($gcloudOutput | Out-String)"}
         if ($DebugLogs) {Write-Log "gcloud exited with code: $LASTEXITCODE"}
@@ -326,23 +326,33 @@ function Invoke-GCSUpload {
             "`"$fullGcsDestination`"" 
         )
 
-        # Execute gsutil using the direct call operator '&'
-        if ($DebugLogs) {
-            Write-Log "Executing gsutil command: '$gsutilFullPath' $($gsutilArgs -join ' ')"
-            $gsutilOutput = & "$gsutilFullPath" @gsutilArgs *>&1
-            Write-Log "gsutil output: $($gsutilOutput | Out-String)"
-            Write-Log "gsutil exited with code: $LASTEXITCODE"
-        } else {
-            & "$gsutilFullPath" @gsutilArgs *>&1
-        }
+        try {
+            if ($DebugLogs) {
+                Write-Log "Executing gsutil command: '$gsutilFullPath' $($gsutilArgs -join ' ')"
+            }
 
-        # Check the exit code of gsutil
-        if ($LASTEXITCODE -ne 0) {
-            throw "gsutil upload failed with exit code: $LASTEXITCODE"
-        }
+            # Capture all output as string to avoid triggering PowerShell error records
+            $gsutilOutput = & "$gsutilFullPath" @gsutilArgs 2>&1 | Out-String
 
-        Write-Log "Artifact uploaded to $fullGcsDestination"
-        return $true, $fullGcsDestination # Return the full GCS path to the uploaded zip
+            if ($DebugLogs) {
+                Write-Log "gsutil output:`n$gsutilOutput"
+                Write-Log "gsutil exited with code: $LASTEXITCODE"
+            }
+
+            if ($LASTEXITCODE -ne 0) {
+                throw "gsutil upload failed with exit code: $LASTEXITCODE"
+            }
+
+            # Clear any lingering error objects to prevent serialization
+            $Error.Clear()
+
+            Write-Log "Artifact uploaded to $fullGcsDestination"
+            return $true, $fullGcsDestination
+        }
+        catch {
+            Write-Log "[ERROR] gsutil upload failed: $_"
+            return $false, $null
+        }
 
     } catch {
         Write-Log "Error during GCS upload process: $($_.Exception.Message)" -Level "ERROR"
