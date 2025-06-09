@@ -48,9 +48,9 @@ function Test-AndCreateFolder {
     if (-not (Test-Path $Path)) {
         Write-Log "Creating folder: $Path"
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
-        #return $true
+        return $true
     }
-    #return $false
+    return $false
 }
 
 function Invoke-GCloudPullMessage {
@@ -250,10 +250,6 @@ function Invoke-UnityBuild {
     )
     $FinalExePath = Join-Path $BuildOutputFolder $ExeName
 
-    if (-not (Test-AndCreateFolder $BuildOutputFolder)) {
-        Write-Log "Build output folder already exists: $BuildOutputFolder"
-    }
-
     $unityCommand = "`"$UnityEditorPath`""
     $unityArgs = @(
         "-batchmode",
@@ -280,33 +276,94 @@ function Invoke-UnityBuild {
 function Invoke-GCSUpload {
     param (
         [string]$LocalPath,
-        [string]$GCSBucket,
-        [string]$GCSObjectPrefix
+        [string]$GCSBucket,        # This should ONLY be the bucket name (e.g., 'my_adk_unity_hackathon_builds_2025')
+        [string]$GCSObjectPrefix   # This should ONLY be the object prefix (e.g., 'game-builds/universal/main')
     )
     try {
-        $finalGcsPath = "$GCSBucket/$GCSObjectPrefix"
-        Write-Log "Uploading '$LocalPath' to GCS: '$finalGcsPath'"
+        $gsutilFullPath = "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gsutil.cmd" # <--- YOUR VERIFIED PATH
 
-        # Upload directory content
-        $gsutilCommandStringDir = "gsutil cp -r `"$LocalPath\*`" `"$finalGcsPath`""
-        #powershell.exe -NoProfile -Command $gsutilCommandStringDir | Out-String | Write-Log
-        if ($DebugLogs) {Write-Log ((powershell.exe -NoProfile -Command $gsutilCommandStringDir) | Out-String)}
-
-
-        # Upload specific log file if it's outside the directory
-        if ($LocalPath -ne $Script:UnityLogFilePath) { # Avoid double upload if log is inside
-            $gsutilLogCommandString = "gsutil cp `"$Script:UnityLogFilePath`" `"$finalGcsPath`""
-            #powershell.exe -NoProfile -Command $gsutilLogCommandString | Out-String | Write-Log
-            if ($DebugLogs) {Write-Log ((powershell.exe -NoProfile -Command $gsutilLogCommandString) | Out-String)}
-
+        # Check if gsutil executable exists at the specified path
+        if (-not (Test-Path $gsutilFullPath)) {
+            throw "gsutil executable not found at '$gsutilFullPath'. Please verify the path and ensure Cloud SDK is installed correctly."
         }
 
-        Write-Log "Artifacts uploaded to $finalGcsPath"
-        return $true, $finalGcsPath
+        if (-not $LocalPath -or -not (Test-Path $LocalPath)) {
+            throw "LocalPath '$LocalPath' is invalid or does not exist."
+        }
+        Write-Log "Preparing to compress: '$LocalPath'"
+
+        # temporary zip file
+        $zipFileName = "$(Split-Path -Leaf $LocalPath).zip" # e.g., MyBuild.zip
+        $tempZipDir =  "C:\Users\unityadmin\temp"
+        if (-not (Test-Path $tempZipDir)) {
+            New-Item -Path $tempZipDir -ItemType Directory -Force | Out-Null
+        } 
+        $tempZipFilePath = Join-Path -Path $tempZipDir -ChildPath $zipFileName
+
+        if ($DebugLogs) {Write-Log "Compressing '$LocalPath' to '$tempZipFilePath'..."}
+        Compress-Archive -Path "$LocalPath\*" -DestinationPath $tempZipFilePath -Force
+        if (-not (Test-Path $tempZipFilePath)) {
+            throw "Failed to create archive at '$tempZipFilePath'"
+        }
+        if ($DebugLogs) {Write-Log "Compression complete."}
+
+        # --- CRITICAL CORRECTIONS FOR GCS PATHS ---
+        # 1. Ensure GCSObjectPrefix uses forward slashes (already assumed good, but reinforce)
+        $GCSObjectPrefix = $GCSObjectPrefix -replace '\\', '/'
+        $GCSObjectPrefix = $GCSObjectPrefix.TrimEnd('/')
+
+        # 2. Construct the GCS object path using forward slashes only
+        #    Note: Join-Path is good for local paths, but for GCS URLs,
+        #    it's safer to explicitly build strings with '/'
+        $gcsObjectName = "$GCSObjectPrefix/$zipFileName"
+
+        # 3. Build the full GCS destination path. $GCSBucket should NOT contain "gs://".
+        #    If $GCSBucket *does* contain "gs://", you need to strip it here first.
+        #    For robustness, let's assume $GCSBucket *might* contain "gs://", and strip it.
+        $cleanGCSBucket = $GCSBucket -replace '^gs://', '' -replace '/$', '' # Remove gs:// from start and trailing slash
+
+        $fullGcsDestination = "gs://$cleanGCSBucket/$gcsObjectName"
+        $fullGcsDestination = $fullGcsDestination -replace '/$', '' # Remove trailing slash
+        # --- END CRITICAL CORRECTIONS ---
+
+
+        if ($DebugLogs) {Write-Log "Uploading '$tempZipFilePath' to GCS: '$fullGcsDestination'"}
+
+        # Upload the single zipped file
+        $gsutilArgs = @(
+            "cp",
+            "`"$tempZipFilePath`"",    # Still needs quotes for gsutil.cmd (local path)
+            "`"$fullGcsDestination`""  # Still needs quotes for gsutil.cmd (GCS URL)
+        )
+
+        # Execute gsutil using the direct call operator '&'
+        if ($DebugLogs) {
+            Write-Log "Executing gsutil command: '$gsutilFullPath' $($gsutilArgs -join ' ')"
+            $gsutilOutput = & "$gsutilFullPath" @gsutilArgs *>&1
+            Write-Log "gsutil output: $($gsutilOutput | Out-String)"
+            Write-Log "gsutil exited with code: $LASTEXITCODE"
+        } else {
+            & "$gsutilFullPath" @gsutilArgs *>&1
+        }
+
+        # Check the exit code of gsutil
+        if ($LASTEXITCODE -ne 0) {
+            throw "gsutil upload failed with exit code: $LASTEXITCODE"
+        }
+
+        Write-Log "Artifact uploaded to $fullGcsDestination"
+        return $true, $fullGcsDestination # Return the full GCS path to the uploaded zip
+
     } catch {
-        Write-Log "Error uploading to GCS: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "Error during GCS upload process: $($_.Exception.Message)" -Level "ERROR"
         Write-Log "$($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.ScriptPosition)" -Level "ERROR"
         return $false, $null
+    } finally {
+        # Clean up the temporary zip file
+        if (Test-Path $tempZipFilePath) {
+            Write-Log "Cleaning up temporary zip file: '$tempZipFilePath'"
+            Remove-Item $tempZipFilePath -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -380,7 +437,6 @@ while (-not (Test-Path $StopFilePath)) {
             if (-not (Test-Path $GitExePath)) {
                 $error_msg = "ERROR: Git executable not found at '$GitExePath'. Please verify Git installation. Aborting."
                 Write-Log $error_msg -Level "ERROR"
-                #Publish-CompletionMessage $receivedBuildId $branchName $commitHash $isTestBuild $false $null $error_msg
                 continue # Skip to the next message
             }
             if ($DebugLogs) {Write-Log "DEBUG: Git executable '$GitExePath' confirmed to exist."}
@@ -423,9 +479,20 @@ while (-not (Test-Path $StopFilePath)) {
 
             # Determine build output folder name
             if ($commitHash) {
-                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')_$($commitHash -replace '[^a-zA-Z0-9_.-]', '_')"
+                $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder $commitHash
             } else {
                 $currentBuildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "Build_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            }
+
+            if (Test-AndCreateFolder $currentBuildOutputFolder) {
+                Write-Log "Created build output folder: $currentBuildOutputFolder"
+                if ($skipUnityBuild) {
+                    if ($DebugLogs) {Write-Log "Creating dummy file for test mode..."}
+                    $dummyFile = Join-Path $currentBuildOutputFolder "DUMMY.txt"
+                    "This is a test build placeholder." | Out-File -FilePath $dummyFile -Encoding UTF8
+                }
+            } else {
+                Write-Log "Build output folder already exists: $currentBuildOutputFolder"
             }
 
             if ($buildStatus -ne "git_failed") { # Only attempt Unity build if Git ops succeeded or not applicable
