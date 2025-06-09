@@ -276,8 +276,8 @@ function Invoke-UnityBuild {
 function Invoke-GCSUpload {
     param (
         [string]$LocalPath,
-        [string]$GCSBucket,        # This should ONLY be the bucket name (e.g., 'my_adk_unity_hackathon_builds_2025')
-        [string]$GCSObjectPrefix   # This should ONLY be the object prefix (e.g., 'game-builds/universal/main')
+        [string]$GCSBucket,       
+        [string]$GCSObjectPrefix  
     )
     try {
         $gsutilFullPath = "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gsutil.cmd" # <--- YOUR VERIFIED PATH
@@ -307,33 +307,23 @@ function Invoke-GCSUpload {
         }
         if ($DebugLogs) {Write-Log "Compression complete."}
 
-        # --- CRITICAL CORRECTIONS FOR GCS PATHS ---
-        # 1. Ensure GCSObjectPrefix uses forward slashes (already assumed good, but reinforce)
         $GCSObjectPrefix = $GCSObjectPrefix -replace '\\', '/'
         $GCSObjectPrefix = $GCSObjectPrefix.TrimEnd('/')
 
-        # 2. Construct the GCS object path using forward slashes only
-        #    Note: Join-Path is good for local paths, but for GCS URLs,
-        #    it's safer to explicitly build strings with '/'
         $gcsObjectName = "$GCSObjectPrefix/$zipFileName"
-
-        # 3. Build the full GCS destination path. $GCSBucket should NOT contain "gs://".
-        #    If $GCSBucket *does* contain "gs://", you need to strip it here first.
-        #    For robustness, let's assume $GCSBucket *might* contain "gs://", and strip it.
-        $cleanGCSBucket = $GCSBucket -replace '^gs://', '' -replace '/$', '' # Remove gs:// from start and trailing slash
+        
+        $cleanGCSBucket = $GCSBucket -replace '^gs://', '' -replace '/$', '' 
 
         $fullGcsDestination = "gs://$cleanGCSBucket/$gcsObjectName"
         $fullGcsDestination = $fullGcsDestination -replace '/$', '' # Remove trailing slash
-        # --- END CRITICAL CORRECTIONS ---
-
 
         if ($DebugLogs) {Write-Log "Uploading '$tempZipFilePath' to GCS: '$fullGcsDestination'"}
 
         # Upload the single zipped file
         $gsutilArgs = @(
             "cp",
-            "`"$tempZipFilePath`"",    # Still needs quotes for gsutil.cmd (local path)
-            "`"$fullGcsDestination`""  # Still needs quotes for gsutil.cmd (GCS URL)
+            "`"$tempZipFilePath`"",    
+            "`"$fullGcsDestination`"" 
         )
 
         # Execute gsutil using the direct call operator '&'
@@ -367,7 +357,8 @@ function Invoke-GCSUpload {
     }
 }
 
-# --- Main Loop ---
+
+# --- Setup ---
 
 Write-Log "UnityBuildListener Service Started."
 
@@ -387,6 +378,8 @@ Test-AndCreateFolder (Split-Path $Script:UnityLogFilePath -Parent)
 Test-AndCreateFolder $Script:BuildOutputBaseFolder
 
 Write-Log "Listening to Pub/Sub subscription: $Script:SubscriptionPath"
+
+# --- Main Loop ---
 
 while (-not (Test-Path $StopFilePath)) {
     $messages = Invoke-GCloudPullMessage -SubscriptionPath $Script:SubscriptionPath
