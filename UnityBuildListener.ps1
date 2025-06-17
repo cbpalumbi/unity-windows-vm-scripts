@@ -532,15 +532,13 @@ while (-not (Test-Path $StopFilePath)) {
             }
 
             # Publish completion message
-            $completionAttributes = @{
-                build_id = $receivedBuildId
-                status = $buildStatus
-                # Add session_id if you extract it from the incoming message
-                # For now, it's a placeholder
-                session_id = "placeholder"
-            }
+            $completionAttributes = @{}
             $completionPayload = @{
-                message = "Build completed for $receivedBuildId"
+                session_id = "placeholder"
+                commit = $commitHash
+                branch = $branchName
+                status = "success"
+                is_test_build = $isTestBuild
                 gcs_path = $finalGcsPath
                 timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
                 build_id = $receivedBuildId
