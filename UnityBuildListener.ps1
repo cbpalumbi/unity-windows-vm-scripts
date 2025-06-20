@@ -8,7 +8,8 @@ $Script:UnityProjectPath = "C:\UnityProjects\Google_ADK_Example_Game"
 $Script:UnityEditorPath = "C:\Program Files\Unity\Hub\Editor\6000.0.50f1\Editor\Unity.exe"
 $Script:UnityLogFilePath = "C:\Users\unityadmin\Documents\UnityLogs\unity_build_log.txt"
 $Script:BuildOutputBaseFolder = "C:\Users\unityadmin\Documents\UnityBuilds" # Base folder for builds
-$Script:BuildMethod = "BuildScript.PerformBuild" # The method to execute in Unity
+$Script:GameBuildMethod = "BuildScript.PerformBuild" # The method to execute in Unity
+$Script:AssetBundleBuildMethod = "AssetBundleScript.BuildAssetBundleForUploadedGLBs" 
 $Script:PollingIntervalSeconds = 5 # How often to poll Pub/Sub for new messages
 $Script:CompletionTopicPath = "projects/cool-ruler-461702-p8/topics/unity-build-completion-topic"
 $Script:GitExePath = "C:\Program Files\Git\bin\git.exe"
@@ -246,19 +247,36 @@ function Invoke-UnityBuild {
         [string]$UnityLogFilePath,
         [string]$BuildMethod,
         [string]$BuildOutputFolder,
-        [string]$ExeName = "Google_ADK_Example_Game.exe"
+        [string]$ExeName = "Google_ADK_Example_Game.exe",
+        [string]$session
     )
     $FinalExePath = Join-Path $BuildOutputFolder $ExeName
 
     $unityCommand = "`"$UnityEditorPath`""
-    $unityArgs = @(
+    if ($BuildMethod -eq $Script:GameBuildMethod) {
+        $unityArgs = @(
+            "-batchmode",
+            "-quit",
+            "-logFile", "`"$UnityLogFilePath`"",
+            "-projectPath", "`"$UnityProjectPath`"",
+            "-executeMethod", "$BuildMethod",
+            "-buildWindowsPlayer", "`"$FinalExePath`""
+        )
+    }
+    elseif ($BuildMethod -eq $Script:AssetBundleBuildMethod) {
+        $unityArgs = @(
         "-batchmode",
         "-quit",
         "-logFile", "`"$UnityLogFilePath`"",
         "-projectPath", "`"$UnityProjectPath`"",
         "-executeMethod", "$BuildMethod",
-        "-buildWindowsPlayer", "`"$FinalExePath`""
-    )
+        "-session", "$session"
+        )
+    }
+    else {
+        Write-Log "Unrecognized build command"
+        return $false
+    }
 
     Write-Log "Executing Unity command: $unityCommand $($unityArgs -join ' ')"
 
@@ -367,6 +385,103 @@ function Invoke-GCSUpload {
     }
 }
 
+function Handle-AssetBuildRequest {
+    param (
+        $message_data
+    )
+
+    # Deconstruct message
+    $buildId = $message_data.build_id
+    $gcsAssetUrl = $message_data.gcs_asset_location_url
+    $sessionId = $message_data.session_id
+    $timestamp = $message_data.request_timestamp
+
+    Write-Log "Handling asset-build for session: $sessionId"
+
+    # Paths
+    $userGlbFolder = Join-Path $Script:UnityProjectPath "UserGlbFiles\$sessionId\assets"
+    $userBundleOutputFolder = Join-Path $Script:UnityProjectPath "BuildLLM\UserAssetBundles\$sessionId\assets"
+    $finalBundleCopyFolder = Join-Path $Script:UnityProjectPath "BuildLLM\Builds\MyAssetBundles"
+
+    # Clean and create GLB folder
+    if (Test-Path $userGlbFolder) {
+        Remove-Item -Recurse -Force $userGlbFolder
+    }
+    New-Item -ItemType Directory -Path $userGlbFolder -Force | Out-Null
+
+    # Download GLB to that folder
+    $glbFilePath = Join-Path $userGlbFolder "uploaded_model.glb"
+    Write-Log "Downloading GLB from $gcsAssetUrl to $glbFilePath"
+    Invoke-WebRequest -Uri $gcsAssetUrl -OutFile $glbFilePath
+
+    # Build asset bundle
+    $unityEditorPath = $Script:UnityEditorPath
+    $unityProjectPath = $Script:UnityProjectPath
+    $logPath = Join-Path $unityProjectPath "asset_bundle_log_$sessionId.txt"
+
+    $assetBundleCommand = "`"$unityEditorPath`""
+    $assetBundleArgs = @(
+        "-batchmode",
+        "-quit",
+        "-logFile", "`"$logPath`"",
+        "-projectPath", "`"$unityProjectPath`"",
+        "-executeMethod", "AssetBundleScript.BuildAssetBundleForUploadedGLBs",
+        "-session", "$sessionId"
+    )
+
+
+
+    # Run Unity headless build
+    $buildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "AssetBuild_$sessionId"
+    Write-Log "Trying to make folder at path $buildOutputFolder"
+
+    if (Test-Path $buildOutputFolder) {
+        Remove-Item -Path $buildOutputFolder -Recurse -Force
+    }
+    Test-AndCreateFolder $buildOutputFolder
+
+    if (Invoke-UnityBuild -UnityEditorPath $unityEditorPath `
+                          -UnityProjectPath $unityProjectPath `
+                          -UnityLogFilePath (Join-Path $buildOutputFolder "unity_build_log.txt") `
+                          -BuildMethod $Script:AssetBundleBuildMethod `
+                          -BuildOutputFolder $buildOutputFolder `
+                          -session $sessionId) {
+        $buildStatus = "success"
+    } else {
+        $buildStatus = "unity_build_failed"
+    }
+
+    Write-Log "Asset build status: $buildStatus"
+
+    # Upload to GCS if success
+    if ($buildStatus -eq "success") {
+        $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $buildOutputFolder `
+                                                -GCSBucket $Script:GCSBucket `
+                                                -GCSObjectPrefix "game-builds/assets/$sessionId/"
+        if ($uploadSuccess) {
+            $finalGcsPath = $uploadedPath
+        } else {
+            $buildStatus = "upload_failed"
+        }
+    }
+
+    # Publish completion message
+    $completionAttributes = @{}
+    $completionPayload = @{
+        session_id = $sessionId
+        status = $buildStatus
+        gcs_path = $finalGcsPath
+        timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
+        build_id = $buildId
+    }
+
+    Invoke-GCloudPublishMessage -TopicPath $Script:CompletionTopicPath `
+                                -MessageAttributes $completionAttributes `
+                                -MessagePayload $completionPayload
+
+    Write-Log "Asset build process completed for session $sessionId with status: $buildStatus"
+    Write-Log "--------------------------------------------------------"
+}
 
 # --- Setup ---
 
@@ -412,30 +527,35 @@ while (-not (Test-Path $StopFilePath)) {
             # For now, let's just exit this iteration of the loop
             continue # Skip to the next message or iteration of the while loop
         }
-
-        # Now access fields directly from the $messagePayload object
-        $receivedBuildId = $messagePayload.build_id
+        
         $command = $messagePayload.command # If you still use a top-level command string
-        $branchName = $messagePayload.branch_name # New field
-        $commitHash = $messagePayload.commit_hash # New field
-        $isTestBuild = $messagePayload.is_test_build # Accessing the boolean directly
 
-        # Your log messages and conditional checks now use the new variables
-        if ($DebugLogs) {
-            Write-Log "Processing build_id: $receivedBuildId"
-            Write-Log "Received command: '$command'"
-            Write-Log "Received branch_name: '$branchName'"
-            Write-Log "Received commit_hash: '$commitHash'"
-            Write-Log "Is Test Build: $isTestBuild"
+        if ($command -eq "asset-build") {
+             Set-Location $UNITY_PROJECT_PATH # Ensure we're in the repo directory
+            Handle-AssetBuildRequest -message_data $messagePayload
         }
-
-        $skipUnityBuild = $isTestBuild
-
-        $buildStatus = "failed"
-        $finalGcsPath = ""
-        $currentBuildOutputFolder = ""
-
         if ($command -eq "start_build") {
+
+            # Now access fields directly from the $messagePayload object
+            $receivedBuildId = $messagePayload.build_id
+            $branchName = $messagePayload.branch_name # New field
+            $commitHash = $messagePayload.commit_hash # New field
+            $isTestBuild = $messagePayload.is_test_build # Accessing the boolean directly
+
+            # Your log messages and conditional checks now use the new variables
+            if ($DebugLogs) {
+                Write-Log "Processing build_id: $receivedBuildId"
+                Write-Log "Received command: '$command'"
+                Write-Log "Received branch_name: '$branchName'"
+                Write-Log "Received commit_hash: '$commitHash'"
+                Write-Log "Is Test Build: $isTestBuild"
+            }
+
+            $skipUnityBuild = $isTestBuild
+
+            $buildStatus = "failed"
+            $finalGcsPath = ""
+            $currentBuildOutputFolder = ""
 
             if (-not (Test-Path $GitExePath)) {
                 $error_msg = "ERROR: Git executable not found at '$GitExePath'. Please verify Git installation. Aborting."
@@ -507,8 +627,9 @@ while (-not (Test-Path $StopFilePath)) {
                     if (Invoke-UnityBuild -UnityEditorPath $Script:UnityEditorPath `
                                         -UnityProjectPath $Script:UnityProjectPath `
                                         -UnityLogFilePath $Script:UnityLogFilePath `
-                                        -BuildMethod $Script:BuildMethod `
-                                        -BuildOutputFolder $currentBuildOutputFolder) {
+                                        -BuildMethod $Script:GameBuildMethod `
+                                        -BuildOutputFolder $currentBuildOutputFolder `
+                                        -session "") {
                         $buildStatus = "success"
                     } else {
                         $buildStatus = "unity_build_failed"
