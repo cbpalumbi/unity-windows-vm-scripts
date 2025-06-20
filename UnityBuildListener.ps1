@@ -410,9 +410,15 @@ function Handle-AssetBuildRequest {
     New-Item -ItemType Directory -Path $userGlbFolder -Force | Out-Null
 
     # Download GLB to that folder
-    $glbFilePath = Join-Path $userGlbFolder "uploaded_model.glb"
-    Write-Log "Downloading GLB from $gcsAssetUrl to $glbFilePath"
-    Invoke-WebRequest -Uri $gcsAssetUrl -OutFile $glbFilePath
+    # Attempt download and capture exit code
+    Write-Log "Running: gsutil cp `"$gcsAssetUrl`" `"$userGlbFolder`""
+    $gsutilResult = & gsutil cp "$gcsAssetUrl" "$userGlbFolder" 2>&1
+    Write-Log "gsutil result: $gsutilResult"
+
+    if (-Not (Test-Path $userGlbFolder)) {
+        Write-Log "ERROR: File was not downloaded to expected path: $userGlbFolder" -Level "ERROR"
+        exit 1
+    }
 
     # Build asset bundle
     $unityEditorPath = $Script:UnityEditorPath
@@ -429,9 +435,11 @@ function Handle-AssetBuildRequest {
         "-session", "$sessionId"
     )
 
+    # Note that for asset build, the build output folder just has the log
+    # The asset bundles are put at <UnityProject>/UserAssetBundles/<session_id>/assets
+    $assetBundleOutputFolder = Join-Path (Join-Path (Join-Path $unityProjectPath "UserAssetBundles") $sessionId) "assets"
+    Write-Log "Asset bundle output folder is $assetBundleOutputFolder"
 
-
-    # Run Unity headless build
     $buildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "AssetBuild_$sessionId"
     Write-Log "Trying to make folder at path $buildOutputFolder"
 
@@ -440,6 +448,7 @@ function Handle-AssetBuildRequest {
     }
     Test-AndCreateFolder $buildOutputFolder
 
+    # Run Unity headless build
     if (Invoke-UnityBuild -UnityEditorPath $unityEditorPath `
                           -UnityProjectPath $unityProjectPath `
                           -UnityLogFilePath (Join-Path $buildOutputFolder "unity_build_log.txt") `
@@ -455,7 +464,7 @@ function Handle-AssetBuildRequest {
 
     # Upload to GCS if success
     if ($buildStatus -eq "success") {
-        $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $buildOutputFolder `
+        $uploadSuccess, $uploadedPath = Invoke-GCSUpload -LocalPath $assetBundleOutputFolder `
                                                 -GCSBucket $Script:GCSBucket `
                                                 -GCSObjectPrefix "game-builds/assets/$sessionId/"
         if ($uploadSuccess) {
