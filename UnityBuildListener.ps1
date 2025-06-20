@@ -399,9 +399,7 @@ function Handle-AssetBuildRequest {
     Write-Log "Handling asset-build for session: $sessionId"
 
     # Paths
-    $userGlbFolder = Join-Path $Script:UnityProjectPath "UserGlbFiles\$sessionId\assets"
-    $userBundleOutputFolder = Join-Path $Script:UnityProjectPath "BuildLLM\UserAssetBundles\$sessionId\assets"
-    $finalBundleCopyFolder = Join-Path $Script:UnityProjectPath "BuildLLM\Builds\MyAssetBundles"
+    $userGlbFolder = Join-Path $Script:UnityProjectPath "UserGlbFiles\$sessionId"
 
     # Clean and create GLB folder
     if (Test-Path $userGlbFolder) {
@@ -409,10 +407,14 @@ function Handle-AssetBuildRequest {
     }
     New-Item -ItemType Directory -Path $userGlbFolder -Force | Out-Null
 
+
+    $gsUtilLsResult = & gsutil ls "gs://my_adk_unity_hackathon_builds_2025/user-asset-files/$sessionId/assets/"  2>&1
+    Write-Log "gsutil list result: $gsUtilLsResult"
+    
     # Download GLB to that folder
     # Attempt download and capture exit code
-    Write-Log "Running: gsutil cp `"$gcsAssetUrl`" `"$userGlbFolder`""
-    $gsutilResult = & gsutil cp "$gcsAssetUrl" "$userGlbFolder" 2>&1
+    Write-Log "Running: gsutil cp -r `"$gcsAssetUrl`" `"$userGlbFolder`""
+    $gsutilResult = & gsutil cp -r "$gcsAssetUrl" "$userGlbFolder" 2>&1
     Write-Log "gsutil result: $gsutilResult"
 
     if (-Not (Test-Path $userGlbFolder)) {
@@ -439,6 +441,11 @@ function Handle-AssetBuildRequest {
     # The asset bundles are put at <UnityProject>/UserAssetBundles/<session_id>/assets
     $assetBundleOutputFolder = Join-Path (Join-Path (Join-Path $unityProjectPath "UserAssetBundles") $sessionId) "assets"
     Write-Log "Asset bundle output folder is $assetBundleOutputFolder"
+
+    if (Test-Path $assetBundleOutputFolder) {
+        Remove-Item -Path $assetBundleOutputFolder -Recurse -Force
+    }
+    Test-AndCreateFolder $assetBundleOutputFolder
 
     $buildOutputFolder = Join-Path $Script:BuildOutputBaseFolder "AssetBuild_$sessionId"
     Write-Log "Trying to make folder at path $buildOutputFolder"
